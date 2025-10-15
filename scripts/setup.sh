@@ -2,28 +2,31 @@
 set -e
 
 echo "=== Doom IDM Environment Setup ==="
-echo "Setting up Python 3.14t free-threading environment with ViZDoom"
+echo "Setting up Python 3.12 environment with ViZDoom"
 echo
 
-# Install uv if not already installed
-if ! command -v uv &> /dev/null; then
-    echo "Installing uv package manager..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-else
-    echo "uv already installed: $(uv --version)"
+# Use Python 3.12 (PyTorch compatible)
+PYVER=3.12
+
+# Check if Python 3.12 is available
+if ! command -v python$PYVER &> /dev/null; then
+    echo "Error: Python $PYVER not found. Please install it first."
+    echo "On Ubuntu/Debian: sudo apt-get install python$PYVER python$PYVER-venv python$PYVER-dev"
+    echo "On Fedora/RHEL: sudo dnf install python$PYVER python$PYVER-devel"
+    exit 1
 fi
 
-# Install Python 3.14t free-threading
-echo "Installing Python 3.14.0+freethreaded..."
-uv python install 3.14t
-
-# Create virtual environment with Python 3.14t
-echo "Creating virtual environment with Python 3.14t..."
-uv venv env314t --python 3.14t
+# Create virtual environment with Python 3.12
+echo "Creating virtual environment with Python $PYVER..."
+python$PYVER -m venv env$PYVER
 
 # Activate environment
-source env314t/bin/activate
+source env$PYVER/bin/activate
+
+# Bootstrap pip in the venv
+echo "Bootstrapping pip..."
+python -m ensurepip
+python -m pip install --upgrade pip
 
 # Install system dependencies for ViZDoom (Ubuntu/Debian)
 echo "Installing system dependencies..."
@@ -46,21 +49,21 @@ fi
 
 # Install Python packages
 echo "Installing Python packages..."
-pip install --upgrade pip
-pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu118
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r requirements.txt
 
-# Clone and build ViZDoom from source for Python 3.14t
+# Clone and build ViZDoom from source
 echo "Building ViZDoom from source..."
 if [ ! -d "ViZDoom" ]; then
     git clone https://github.com/Farama-Foundation/ViZDoom.git
 fi
 
 cd ViZDoom
-pip install .
+python -m pip install .
 cd ..
 
 echo
 echo "=== Setup Complete ==="
-echo "Activate environment: source env314t/bin/activate"
-echo "Run training: PYTHON_GIL=0 python idm.py"
+echo "Activate environment: source env$PYVER/bin/activate"
+echo "Run training: python idm.py"
 echo
