@@ -2,9 +2,19 @@
 debug/
 env/
 env314t/
+env3.12/
 Arnold/
 wandb/
 agent_playback/
 ViZDoom/
 screens/
 _vizdoom/
+
+# WAD files (copyrighted game files)
+*.WAD
+*.wad
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/

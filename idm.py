@@ -312,7 +312,12 @@ def stack_frames(frame_buffer, new_frame):
 
 def run_episode(thread_id, agent, fwd_model, phi_enc, buffer, stats, frame_counter, device='cpu'):
     game = vzd.DoomGame()
-    game.set_doom_game_path("/home/minjune/Downloads/Doom1.WAD")
+    # Get WAD path relative to this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    wad_path = os.path.join(script_dir, "Doom1.WAD")
+    if not os.path.exists(wad_path):
+        raise FileNotFoundError(f"Doom1.WAD not found at {wad_path}. Please place it in the repo root.")
+    game.set_doom_game_path(wad_path)
     game.set_doom_map("E1M1")
     game.set_render_hud(False)
     game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
