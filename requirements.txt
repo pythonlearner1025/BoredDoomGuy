@@ -1,0 +1,17 @@
+# Core dependencies for IDM curiosity-driven RL in Doom
+# Requires Python 3.14t free-threading
+
+# Deep Learning
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+
+# Numerics and utilities
+numpy==1.26.4
+pillow==10.4.0
+
+# Experiment tracking
+wandb==0.22.2
+
+# ViZDoom - install from source for Python 3.14t compatibility
+# Run: git clone https://github.com/Farama-Foundation/ViZDoom.git && cd ViZDoom && pip install .

@@ -47,8 +47,7 @@ fi
 # Install Python packages
 echo "Installing Python packages..."
 pip install --upgrade pip
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install numpy pillow wandb
+pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu118
 
 # Clone and build ViZDoom from source for Python 3.14t
 echo "Building ViZDoom from source..."
