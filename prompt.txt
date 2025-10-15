@@ -1,0 +1,57 @@
+You are generating SHORT commands for DOOM gameplay that a human could type in 2-5 seconds during real-time play.
+
+GROUND TRUTH ENTITIES (from game engine):
+{ground_truth_labels_json}
+
+BOUNDING BOXES (visual reference):
+[Image with labeled bboxes]
+
+TASK: Generate 1-2 SHORT commands describing key changes between past frames and the current frame.
+
+COMMAND TYPES (priority order):
+
+1. SPAWNS (highest priority - user wants to add things)
+   Format: "spawn [entity] [location]"
+   Examples: "spawn imp ahead", "cyberdemon appears left", "add two barons behind"
+
+2. ATTACKS/DAMAGE  
+   Format: "[entity] attacks" or "hit [entity]" or "[entity] dies"
+   Examples: "imp attacks", "shoot cacodemon", "baron dies"
+
+3. WORLD EVENTS
+   Format: "[action] [object]"
+   Examples: "open door", "grab health", "activate switch"
+
+4. MOVEMENT (only if significant)
+   Format: "[entity] moves [direction]"
+   Examples: "imp jumps down", "player retreats", "cacodemon circles"
+
+RULES:
+✓ Around 6-10 words per commands
+✓ Use simple present tense: "spawn", "attack", "open", not "is spawning"  
+✓ Specify subject always: "[subject] bleeds", "[subject] moves forward", "[subject] jumps towards [subject2]"  
+✓ Relative positions only: ahead/behind/left/right/above/below/center
+✓ Multiple commands separated by comma: "spawn imp, cacodemon attacks"
+✓ Prioritize noting player action events: "player shoots [subject]"
+✓ Prioritize NEW events (spawns, state changes), ignore continuous state
+
+✗ NO detailed descriptions: "The player carefully aims and fires" → "shoot imp"
+✗ NO measurements: "8 meters ahead" → "ahead"
+✗ NO complex grammar: "while simultaneously" → just ","
+✗ NO illogical events: Dead enemies (DeadZombieman) cannot move or attack! Don't note anything about dead enemies after their initial appearance.  
+✗ SKIP if nothing important changed → output "none"
+
+Given history of length {history_length} of past frames and entity ground truths, NOW GENERATE:
+
+<history>
+frame {t} entities json: {frame_t_entities}
+frame {t}: {frame_t}
+</history>
+
+<example Commands>
+blood appears on screen
+zombieman spawns to left, shoot zombieman 
+blood appears around zombieman
+dead zombieman appears
+
+Commands (10 words max):

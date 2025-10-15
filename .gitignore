@@ -1,0 +1,10 @@
+*.pth
+debug/
+env/
+env314t/
+Arnold/
+wandb/
+agent_playback/
+ViZDoom/
+screens/
+_vizdoom/

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+
+#####################################################################
+# Test script for human to interact with doom via mouse / keyboard,
+# and save frames. The frames will be ran through VLM to choose the best
+# captioning model. The best captioning model will then be used to 
+# create labeled dataset of DOOM gameplay, which will be used to train 
+# text conditioning of SD 1.5 modified to act as a real-time game engine (build on GameNGen work by GDM, but with promptable game events)
+#####################################################################
+
+import os
+from argparse import ArgumentParser
+from random import choice
+from PIL import Image
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import vizdoom as vzd
+import cv2
+
+
+DEFAULT_CONFIG = os.path.join(vzd.scenarios_path, "my_way_home.cfg")
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser(
+        "ViZDoom example showing how to use information about objects and map."
+    )
+    parser.add_argument(
+        dest="config",
+        default=DEFAULT_CONFIG,
+        nargs="?",
+        help="Path to the configuration file of the scenario."
+        " Please see "
+        "../../scenarios/*cfg for more scenarios.",
+    )
+
+    args = parser.parse_args()
+
+    game = vzd.DoomGame()
+    game.set_doom_game_path("/home/minjune/Downloads/Doom1.WAD")
+    game.load_config("")
+    game.set_doom_scenario_path("")
+    game.set_doom_map("map01")       
+    game.set_render_hud(True)
+    game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
+    game.set_window_visible(True)
+    game.set_mode(vzd.Mode.ASYNC_SPECTATOR)
+    game.init()
+    game.new_episode()
+    print("new ep")
+
+    os.makedirs("screens", exist_ok=True)
+    frame_idx = 0
+
+    key_map = {
+        ord('w'): '+forward', ord('s'): '+back',
+        ord('a'): '+moveleft', ord('d'): '+moveright',
+        ord(' '): '+use', ord('e'): '+use',
+    }
+    pressed_keys = set()
+
+    while True:
+        state = game.get_state()
+        if state is None:
+            break
+
+        screen = state.screen_buffer
+        rgb = np.moveaxis(screen, 0, -1)
+
+        cv2.imshow("DOOM", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        key = cv2.waitKey(28) & 0xFF
+
+        if key == ord('q'):
+            break
+        elif key != 255 and key in key_map:
+            game.send_game_command(key_map[key])
+        elif key == ord('x'):
+            img = Image.fromarray(rgb)
+            img.save(f"screens/frame_{frame_idx:05d}.png")
+            print(f"Saved frame {frame_idx}")
+            frame_idx += 1
+
+        time.sleep(0.028)
+
+    cv2.destroyAllWindows()
+    game.close()
