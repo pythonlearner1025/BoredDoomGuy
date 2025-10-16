@@ -13,5 +13,7 @@ pillow==10.4.0
 # Experiment tracking
 wandb==0.22.2
 
-# ViZDoom - install from source (setup.sh handles this automatically)
-# Manual: git clone https://github.com/Farama-Foundation/ViZDoom.git && cd ViZDoom && python -m pip install .
+# ViZDoom - Doom environment for RL
+# Note: May need to be built from source for best compatibility
+# If pip install fails, use: git clone https://github.com/Farama-Foundation/ViZDoom.git && cd ViZDoom && python -m pip install .
+vizdoom
