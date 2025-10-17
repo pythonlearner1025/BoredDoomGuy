@@ -112,8 +112,7 @@ The outer loop serially performs PPO updates, then replay-driven training for dy
 
 ### My empirical notes (to be completed after experiments)
 
-- **Does LPM actually suppress noisy-TV artefacts in Doom E1M1?**  
-  > _Leave this section blank until I run controlled tests; note down observations, plots, and failure cases here._
+- Common failure mode is error model and dynamics model trained on the same stream => eventually they converge on the same error, and reward goes to zero, curiosity dies. Solution: stagger error model in time, its training data should be sampled from episodes < T-1 where T is current iteration 
 
 ## 7. TODOs for future revision
 

@@ -42,20 +42,21 @@ def get_env_int(name, default):
 # Hyperparameters
 # ============================================================================
 ITERS = get_env_int("LPM_ITERS", 1000)
-EPOCHS = 4  # INCREASED: More training iterations to learn bullet/wall dynamics thoroughly
-MAX_ROLLOUT_FRAMES = get_env_int("LPM_MAX_ROLLOUT_FRAMES", int(2e4))  # Reduced to avoid OOM
-MAX_FRAMES_PER_EPISODE = get_env_int("LPM_MAX_FRAMES_PER_EPISODE", int(37.5*60*1))  # Per-thread 1 minute episode limit
+EPOCHS = 3  
+MAX_ROLLOUT_FRAMES = get_env_int("LPM_MAX_ROLLOUT_FRAMES", int(1e4))  # Reduced to avoid OOM
+MAX_FRAMES_PER_EPISODE = get_env_int("LPM_MAX_FRAMES_PER_EPISODE", int(37.5*60*2))  # Per-thread 1 minute episode limit
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
 GAE_LAMBDA = 0.95
 CLIP_COEF = 0.1
-ENT_COEF = 0.01   
+ENT_COEF_START = 0.05   
+ENT_COEF_END = 0.001   
 VF_COEF = 0.5
-MAX_GRAD_NORM = 1.0
+MAX_GRAD_NORM = 0.5
 MINIBATCH_SIZE = 2048
 LEARNING_RATE = 1e-4
 
-INTRINSIC_ONLY = True  # If True, train with only intrinsic reward (no extrinsic)
+INTRINSIC_ONLY = FALSE  # If True, train with only intrinsic reward (no extrinsic)
 INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.5
 EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.5  # Set to 0.0 for pure curiosity (Burda et al.)
 IGNORE_DONES = True  # "Death is not the end" - infinite horizon bootstrapping
@@ -69,10 +70,10 @@ DYNAMICS_REPLAY_SIZE = MAX_ROLLOUT_FRAMES * 3
 
 ERROR_WARMUP = ERROR_BUFFER_SIZE // 2
 
-DYNAMICS_LEARNING_RATE = 2e-4
-ERROR_LEARNING_RATE = 3e-4
-DYNAMICS_GRAD_STEPS = 10
-ERROR_GRAD_STEPS = 10
+DYNAMICS_LEARNING_RATE = 1e-5
+ERROR_LEARNING_RATE = 5e-5
+DYNAMICS_GRAD_STEPS = 3
+ERROR_GRAD_STEPS = 6
 
 LPM_HIDDEN = 512
 DYNAMICS_BATCH_SIZE = 512
@@ -125,6 +126,26 @@ class RunningStats():
                 return self.count, self.mean, float('nan')
             var = self.M2 / (self.count - 1)  # sample variance
             return self.count, self.mean, math.sqrt(var)
+
+class RewardRMS:
+    """Tracks running root-mean-square for per-step rewards."""
+    def __init__(self, eps=1e-8):
+        self.mean2 = eps
+        self.count = eps
+
+    def update(self, x):
+        """x: tensor or array of per-step rewards."""
+        if isinstance(x, torch.Tensor):
+            tensor = x
+        else:
+            tensor = torch.tensor(x, dtype=torch.float32)
+        if tensor.numel() == 0:
+            return
+        self.count += tensor.numel()
+        self.mean2 += (tensor.float() ** 2).sum().item()
+
+    def std(self):
+        return math.sqrt(self.mean2 / self.count)
 
 # ============================================================================
 # Neural Network Components
@@ -327,6 +348,7 @@ class DynamicsReplayBuffer:
         next_obs_batch = torch.tensor(np.stack(self.next_obs[:batch_size]), dtype=torch.float32)
         return obs_batch, act_batch, next_obs_batch
 
+'''
 class ErrorReplayBuffer:
     """Queue storing (obs, action, epsilon) tuples for error model training."""
     def __init__(self, capacity):
@@ -337,6 +359,9 @@ class ErrorReplayBuffer:
     
     def extend(self, obs_batch, action_batch, epsilon_batch):
         for o, a, e in zip(obs_batch, action_batch, epsilon_batch):
+            if len(self.storage) >= self.capacity:
+                self.storage.pop(0)
+
             sample = (o.astype(np.uint8), int(a), float(e))
             self.storage.append(sample)
     
@@ -350,6 +375,42 @@ class ErrorReplayBuffer:
         act_batch = torch.tensor([self.storage[i][1] for i in range(batch_size)], dtype=torch.long)
         eps_batch = torch.tensor([self.storage[i][2] for i in range(batch_size)], dtype=torch.float32)
         return obs_batch, act_batch, eps_batch
+'''
+
+class ErrorReplayBuffer:
+
+    """Queue storing (obs, action, epsilon) tuples for error model training."""
+
+    def __init__(self, capacity):
+        from collections import deque
+        self.capacity = capacity
+        self.ready = deque(maxlen=capacity)
+        self.pending = deque()
+
+    def __len__(self):
+        return len(self.ready)
+
+    def extend(self, obs_batch, action_batch, epsilon_batch):
+        for o, a, e in zip(obs_batch, action_batch, epsilon_batch):
+            sample = (o.astype(np.uint8), int(a), float(e))
+            self.pending.append(sample)
+            if len(self.pending) > self.capacity:
+                self.pending.popleft()
+
+    def commit_pending(self):
+        while self.pending:
+            self.ready.append(self.pending.popleft())
+
+    def sample(self, batch_size):
+        if len(self.ready) < batch_size:
+            raise ValueError("Not enough committed samples for error buffer")
+
+        random.shuffle(self.ready)
+        obs_batch = torch.tensor(np.stack([self.ready[i][0] for i in range(batch_size)]), dtype=torch.float32)
+        act_batch = torch.tensor([self.ready[i][1] for i in range(batch_size)], dtype=torch.long)
+        eps_batch = torch.tensor([self.ready[i][2] for i in range(batch_size)], dtype=torch.float32)
+        return obs_batch, act_batch, eps_batch
+
 # ============================================================================
 # GAE Computation
 # ============================================================================
@@ -495,6 +556,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
 
         # Get action from agent
         obs_t = torch.tensor(obs_stacked, dtype=torch.float32, device=device).unsqueeze(0)
+
         with torch.no_grad():
             logits, val = agent.forward(obs_t)
             dist = torch.distributions.Categorical(logits=logits)
@@ -503,8 +565,11 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
 
         act_idx_item = act_idx.item()
         act_onehot = F.one_hot(act_idx, n_actions).float().unsqueeze(0)
+        last_frame_t = obs_stacked[-1:, :, :]
+
         with torch.no_grad():
-            phi_t = encoder_model(obs_t)
+            last_frame_t = torch.tensor(last_frame_t, dtype=torch.float32, device=device).unsqueeze(0)
+            phi_t = encoder_model(last_frame_t)
             pred_next = dynamics_model(phi_t, act_onehot)
             expected_error_log = error_model(phi_t, act_onehot).item()
             expected_error = math.exp(expected_error_log)
@@ -524,18 +589,24 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
             frame_buffer_next = stack_frames(frame_buffer, raw_frame_next)
             obs_next_stacked = np.stack(frame_buffer_next, axis=0)  # (4, H, W) grayscale
 
+            last_frame_next_t = obs_next_stacked[-1:, :, :]
+
             # Compute intrinsic reward using full frame stack
             with torch.no_grad():
-                obs_next_t = torch.tensor(obs_next_stacked, dtype=torch.float32, device=device).unsqueeze(0)
+                obs_next_t = torch.tensor(last_frame_next_t, dtype=torch.float32, device=device).unsqueeze(0)
                 phi_next_t = encoder_model(obs_next_t)
 
                 mse = F.mse_loss(pred_next, phi_next_t, reduction='none')
             mse_flat = mse.view(mse.shape[0], -1).mean(dim=1)
             epsilon = mse_flat.item()
         else:
+            # IDK if this is right 
+            continue
+            '''
             obs_next_stacked = np.zeros_like(obs_stacked)  # Placeholder
             raw_frame_next_hwc = np.zeros_like(raw_frame_hwc)
             epsilon = 0.0
+            '''
 
         intrinsic_reward = (expected_error - epsilon) if error_ready else 0.0
 
@@ -563,9 +634,9 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         run_rwd_e = run_rwd_e * GAMMA_EXT + rwd_e
 
     # Update stats
-    rwd_i_rms, rwd_e_rms = stats
-    rwd_i_rms.update(run_rwd_i)
-    rwd_e_rms.update(run_rwd_e)
+    intrinsic_stats, extrinsic_stats = stats
+    intrinsic_stats.update(run_rwd_i)
+    extrinsic_stats.update(run_rwd_e)
 
     # Update frame counter atomically
     with frame_counter:
@@ -621,7 +692,7 @@ def run_parallel_episodes(n_threads, agent, dynamics_model, error_model, encoder
 # PPO Update
 # ============================================================================
 def ppo_update(agent, optimizer, obs_batch, act_batch, old_logp_batch,
-               adv_batch, ret_batch, clip_coef=CLIP_COEF, ent_coef=ENT_COEF,
+               adv_batch, ret_batch, clip_coef=CLIP_COEF, ent_coef=0.01,
                vf_coef=VF_COEF):
     """
     Perform one PPO update step.
@@ -714,7 +785,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    cpus = multiprocessing.cpu_count()
+    cpus = 8#multiprocessing.cpu_count()
     n_threads_override = os.environ.get("LPM_THREADS")
     if n_threads_override is not None:
         try:
@@ -729,7 +800,7 @@ if __name__ == '__main__':
     agent = Agent(n_actions).to(device)
     dynamics_model = LPMDynamicsModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
     error_model = LPMErrorModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
-    encoder_model = RandomEncoder(out_dim=ENCODER_FEATS).to(device)
+    encoder_model = RandomEncoder(out_dim=ENCODER_FEATS, in_ch=1).to(device)
 
     agent_optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
     dynamics_optimizer = torch.optim.Adam(dynamics_model.parameters(), lr=DYNAMICS_LEARNING_RATE)
@@ -738,9 +809,10 @@ if __name__ == '__main__':
     dynamics_buffer = DynamicsReplayBuffer(DYNAMICS_REPLAY_SIZE)
     error_buffer = ErrorReplayBuffer(ERROR_BUFFER_SIZE)
 
-    rwd_i_rms = RunningStats()
-    rwd_e_rms = RunningStats()
-    stats = (rwd_i_rms, rwd_e_rms)
+    intrinsic_rms = RewardRMS()
+    intrinsic_stats = RunningStats()
+    extrinsic_stats = RunningStats()
+    stats = (intrinsic_stats, extrinsic_stats)
 
     for iter_idx in range(ITERS):
         print(f"\n=== Iteration {iter_idx+1}/{ITERS} ===")
@@ -810,11 +882,14 @@ if __name__ == '__main__':
                 eps_ep = torch.tensor(epsilons_ep, dtype=torch.float32)
                 dones_ep = torch.tensor(dones, dtype=torch.bool)
 
-                _, _, std_i = rwd_i_rms.get()
-                _, _, std_e = rwd_e_rms.get()
+                intrinsic_rms.update(rwds_i_ep)
+                intrinsic_std = max(intrinsic_rms.std(), 1e-3)
 
-                rwds_i_norm = rwds_i_ep / max(std_i if not math.isnan(std_i) else 1.0, 1e-3)
-                rwds_e_norm = rwds_e_ep / max(std_e if not math.isnan(std_e) else 1.0, 1e-3)
+                _, _, std_e = extrinsic_stats.get()
+                extrinsic_std = max(std_e if not math.isnan(std_e) else 1.0, 1e-3)
+
+                rwds_i_norm = rwds_i_ep / intrinsic_std
+                rwds_e_norm = rwds_e_ep / extrinsic_std
 
                 total_rwds_ep = EXTRINSIC_COEF * rwds_e_norm + INTRINSIC_COEF * rwds_i_norm
 
@@ -831,7 +906,7 @@ if __name__ == '__main__':
                     vals_ep.unsqueeze(1),
                     dones_ep.unsqueeze(1),
                     next_val.unsqueeze(0),
-                    GAMMA_EXT,
+                    GAMMA_INT, # TODO change in INT+EXT case
                     GAE_LAMBDA,
                     ignore_dones=IGNORE_DONES
                 )
@@ -896,6 +971,8 @@ if __name__ == '__main__':
         for epoch in range(EPOCHS):
             np.random.shuffle(indices)
             epoch_start = time.time()
+            ENT_COEF = (1/math.e**(iter_idx/ITERS * math.log(ENT_COEF_START/ENT_COEF_END))) * ENT_COEF_START
+
             for start in range(0, n_samples, MINIBATCH_SIZE):
                 end = min(start + MINIBATCH_SIZE, n_samples)
                 mb_idx = indices[start:end]
@@ -904,7 +981,7 @@ if __name__ == '__main__':
                 pi_loss, v_loss, ent_loss = ppo_update(
                     agent, agent_optimizer,
                     mb_obs, acts_t[mb_idx].to(device), logps_t[mb_idx].to(device),
-                    advantages[mb_idx].to(device), returns[mb_idx].to(device)
+                    advantages[mb_idx].to(device), returns[mb_idx].to(device), ent_coef=ENT_COEF
                 )
 
                 total_pi_loss += pi_loss
@@ -921,8 +998,11 @@ if __name__ == '__main__':
                 act_onehot = F.one_hot(act_b.to(device), n_actions).float()
 
                 with torch.no_grad():
-                    phi_obs = encoder_model(obs_b)
-                    phi_next = encoder_model(next_obs_b)
+
+                    last_frame = obs_b[:, -1:, :, :]  # Shape: (B, 1, H, W)
+                    last_frame_next = next_obs_b[:, -1:, :, :]  # Shape: (B, 1, H, W)
+                    phi_obs = encoder_model(last_frame)
+                    phi_next = encoder_model(last_frame_next)
 
                 pred_next = dynamics_model(phi_obs, act_onehot)
                 dyn_loss = F.mse_loss(pred_next, phi_next)
@@ -944,7 +1024,9 @@ if __name__ == '__main__':
                 eps_b = eps_b.to(device)
 
                 with torch.no_grad():
-                    phi_obs = encoder_model(obs_b)
+                    last_frame = obs_b[:, -1:, :, :]  # Shape: (B, 1, H, W)
+
+                    phi_obs = encoder_model(last_frame)
 
                 eps_pred = error_model(phi_obs, act_onehot)
                 log_targets = torch.log(eps_b + EPSILON_CLAMP)
@@ -974,8 +1056,8 @@ if __name__ == '__main__':
         error_actual_mean = eps_actual_total / max(error_updates, 1) if error_updates else 0.0
 
         iter_time = time.time() - iter_start
-        _, mean_i_running, std_i_running = rwd_i_rms.get()
-        _, mean_e_running, std_e_running = rwd_e_rms.get()
+        _, mean_i_running, std_i_running = intrinsic_stats.get()
+        _, mean_e_running, std_e_running = extrinsic_stats.get()
 
         batch_mean_i = np.mean(all_rwds_i_raw) if all_rwds_i_raw else 0.0
         batch_std_i = np.std(all_rwds_i_raw) if all_rwds_i_raw else 0.0
@@ -1035,8 +1117,8 @@ if __name__ == '__main__':
 
         for k,v in log_dict.items():
             print(k, ": ", v)
-
-
+        
+        error_buffer.commit_pending()
         wandb.log(log_dict)
 
         print(f"Timer {iter_time:.1f}s | FPS: {frame_counter.get()/iter_time:.0f}")
