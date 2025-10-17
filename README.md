@@ -1,109 +1,121 @@
-# Doom IDM Curiosity-Driven RL
+# Doom Curiosity Playground (notes-in-progress)
 
-Intrinsic Curiosity Module (ICM) implementation for Doom using PPO, based on:
-- [Burda et al. 2018 - Large-Scale Study of Curiosity-Driven Learning](https://arxiv.org/abs/1808.04355)
-- [Pathak et al. 2017 - Curiosity-driven Exploration](https://arxiv.org/abs/1705.05363)
+> ⚠️ This README is intentionally incomplete. I will come back and fill in the conceptual and algorithmic explanations after I’ve internalised both papers.
 
-## Setup
+## 1. Install & Run (tedious bits handled here)
 
-### 1. Clone the repository
-
+### 1.1 Clone & assets
 ```bash
 git clone https://github.com/pythonlearner1025/BoredDoomGuy.git
 cd BoredDoomGuy
 ```
 
-### 2. Obtain Doom1.WAD
+Download/locate `Doom1.WAD` (Ultimate Doom). Place it at the repo root next to `idm.py`.
 
-You need the original Doom 1 WAD file. Place it as `Doom1.WAD` in the repository root.
+- Steam/GOG purchasers: copy the original WAD and rename to `Doom1.WAD`
+- Shareware fallback:
+  ```bash
+  wget https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad
+  mv doom1.wad Doom1.WAD
+  ```
 
-**Option 1: Purchase the game**
-- [Steam](https://store.steampowered.com/app/2280/Ultimate_Doom/)
-- [GOG](https://www.gog.com/game/the_ultimate_doom)
-
-**Option 2: Use shareware version**
+### 1.2 Python virtualenv
 ```bash
-wget https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad
-mv doom1.wad Doom1.WAD
+python3 -m venv env
+source env/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-### 3. Run setup script
+PyTorch + ViZDoom wheel selections are pinned inside `requirements.txt`. If wheels fail for your platform, rebuild ViZDoom from source (see `scripts/`).
 
+### 1.3 Baseline run (ICM)
 ```bash
-bash scripts/setup.sh
-```
-
-This will:
-- Install Python 3.12 (if not present)
-- Create virtual environment
-- Install system dependencies (Boost, SDL2, OpenAL, etc.)
-- Install PyTorch with CUDA support
-- Build ViZDoom from source
-
-### 4. Train the agent
-
-```bash
-source env3.12/bin/activate
+source env/bin/activate
 python idm.py
 ```
 
-Monitor training at the wandb URL printed to console.
-
-## Project Structure
-
-```
-.
-├── idm.py              # Main training script (ICM + PPO)
-├── scripts/
-│   ├── setup.sh        # Environment setup script
-│   └── *.sh            # Other utility scripts
-├── test/               # Test scripts
-├── Arnold/             # Arnold DQN framework (legacy)
-├── requirements.txt    # Python dependencies
-└── README.md           # This file
+### 1.4 LPM run
+```bash
+source env/bin/activate
+python idm_lpm.py  # accepts env overrides like LPM_ITERS, LPM_DRY_RUN
 ```
 
-## Configuration
+WandB logging is enabled by default; set `WANDB_MODE=disabled` if running in restricted environments.
 
-Key hyperparameters in `idm.py`:
+## 2. Environment snapshot
 
+- **Level**: Doom 1, map `E1M1` (Hangar)
+- **API**: ViZDoom player mode, 60×80 grayscale stacks (FRAME_SKIP=4, FRAME_STACK=4)
+- **Action space**: macro-actions defined in `MACRO_ACTIONS` inside each script
+
+TODO: Describe relevant extrinsic rewards, termination conditions, and known quirks (e.g., teleports, enemies, doors).
+
+## 3. Papers & origin
+
+| Implementation | Reference | Link |
+| -------------- | --------- | ---- |
+| `idm.py`       | Pathak et al., Intrinsic Curiosity Module | https://arxiv.org/pdf/1705.05363 |
+| `idm_lpm.py`   | *Beyond Noisy TVs: Noise-Robust Exploration via Learning Progress Monitoring* | https://arxiv.org/pdf/2509.25438v1 |
+
+I will summarise the contributions from each once I finish re-reading them carefully.
+
+## 4. `idm.py` – Intrinsic Curiosity Module (outline for me to fill)
+
+### 4.1 Core idea (placeholder)
+- TODO: explain inverse dynamics vs forward model loss trade-off.
+- TODO: discuss intrinsic reward scaling and running stats.
+
+### 4.2 Implementation pointers
 ```python
-INTRINSIC_ONLY = True        # Pure curiosity (no extrinsic reward)
-USE_INVERSE_DYNAMICS = True  # ICM vs Random Features
-IGNORE_DONES = True          # "Death is not the end"
-EPOCHS = 15                  # PPO epochs per iteration
-FWD_HIDDEN = 1024           # Forward model capacity
+# Encoder & policy/value heads
+agent = Agent(n_actions).to(device)               # idm.py:120-ish
+
+# Curiosity models
+phi_enc = TrainableEncoder(...); fwd_model = ForwardDynamicsModel(...)
+idm_model = InverseDynamicsModel(...)
 ```
 
-## Troubleshooting
+### 4.3 What I still need to reason about
+- [ ] How PPO minibatching interacts with feature learning.
+- [ ] Effect of `IGNORE_DONES=True` in Doom (think about lava pits / death resets).
+- [ ] Calibration of intrinsic vs extrinsic weighting in this specific level.
 
-**"Doom1.WAD not found"**
-- Make sure `Doom1.WAD` is in the repo root directory
-- Check the filename is exactly `Doom1.WAD` (case-sensitive on Linux)
+## 5. `idm_lpm.py` – Learning Progress Monitoring (outline for me to fill)
 
-**"No module named 'vizdoom'"**
-- ViZDoom must be built from source for Python 3.12
-- Re-run `scripts/setup.sh` to rebuild
+### 5.1 Core idea (placeholder)
+- TODO: articulate the dual-network setup and why expected past error matters.
+- TODO: capture how log-MSE stabilises the intrinsic signal.
 
-**CUDA out of memory**
-- Reduce `MINIBATCH_SIZE` in `idm.py`
-- Reduce `MAX_ROLLOUT_FRAMES`
-- Use fewer worker threads
+### 5.2 Code landmarks
+```python
+dynamics_model = LPMDynamicsModel(n_actions).to(device)  # idm_lpm.py:781-784
+error_model = LPMErrorModel(n_actions).to(device)
 
-## References
-
-```bibtex
-@article{burda2018largescale,
-  title={Large-Scale Study of Curiosity-Driven Learning},
-  author={Burda, Yuri and Edwards, Harri and Storkey, Amos and Klimov, Oleg},
-  journal={arXiv preprint arXiv:1808.04355},
-  year={2018}
-}
-
-@inproceedings{pathak2017curiosity,
-  title={Curiosity-driven Exploration by Self-supervised Prediction},
-  author={Pathak, Deepak and Agrawal, Pulkit and Efros, Alexei A and Darrell, Trevor},
-  booktitle={ICML},
-  year={2017}
-}
+# Intrinsic reward inside rollout:
+intrinsic_reward = (expected_error - epsilon) if error_ready else 0.0
 ```
+
+### 5.3 Handling the noisy TV claim
+- TODO: Summarise the noisy-TV argument from the paper (expected error vs single-sample).
+- TODO: Contrast with raw prediction error approaches.
+- TODO: Note any implementation gotchas (buffers, warm-up, log-space).
+
+### 5.4 My empirical notes (to be completed after experiments)
+
+- **Does LPM actually suppress noisy-TV artefacts in Doom E1M1?**  
+  > _Leave this section blank until I run controlled tests; note down observations, plots, and failure cases here._
+
+## 6. Shared config knobs (for quick lookup)
+
+- `FRAME_SKIP`, `FRAME_STACK`, `MAX_ROLLOUT_FRAMES`, `MAX_FRAMES_PER_EPISODE`
+- Threading: defaults to `cpu_count() - 2`, override with `LPM_THREADS` (LPM script) or edit constants in `idm.py`
+- Checkpoint cadence: every 25 iterations (ICM) and mirrored in LPM script
+- Debug frame dumps land in `debug/` (ignored by git)
+
+## 7. TODOs for future revision
+
+- [ ] Flesh out conceptual sections above in my own words.
+- [ ] Add diagrams / reward curves once experiments stabilise.
+- [ ] Document best-known hyperparameter tweaks for Doom E1M1.
+- [ ] Summarise differences between `idm.py` and `idm_lpm.py` once confident.
