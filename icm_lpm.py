@@ -43,8 +43,8 @@ def get_env_int(name, default):
 # ============================================================================
 ITERS = get_env_int("LPM_ITERS", 1000)
 EPOCHS = 3  
-MAX_ROLLOUT_FRAMES = get_env_int("LPM_MAX_ROLLOUT_FRAMES", int(1e4))  # Reduced to avoid OOM
-MAX_FRAMES_PER_EPISODE = get_env_int("LPM_MAX_FRAMES_PER_EPISODE", int(37.5*60*2))  # Per-thread 1 minute episode limit
+MAX_ROLLOUT_FRAMES = get_env_int("LPM_MAX_ROLLOUT_FRAMES", int(8e4))  # Reduced to avoid OOM
+MAX_FRAMES_PER_EPISODE = get_env_int("LPM_MAX_FRAMES_PER_EPISODE", int(37.5*60*3))  # Per-thread 1 minute episode limit
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
 GAE_LAMBDA = 0.95
@@ -58,16 +58,19 @@ MINIBATCH_SIZE = 2048
 LEARNING_RATE = 1e-4
 
 INTRINSIC_ONLY = False  # If True, train with only intrinsic reward (no extrinsic)
-INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.7
-EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.3  # Allow sparse extrinsic reward to break ties
+INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.3
+EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.7  # Allow sparse extrinsic reward to break ties
 IGNORE_DONES = True  # "Death is not the end" - infinite horizon bootstrapping
-FRAME_SKIP = 2
+FRAME_SKIP = 4
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
 ENCODER_FEATS = 512
 
 # Novelty
-SKIP_FRAMES_NOVELTY = 10  # Only update episodic novelty every N frame stacks
+SKIP_FRAMES_NOVELTY = 10  # Only update novelty buffers every N frame stacks
 NOVELTY_SIMILARITY_THRESH = 0.8
+LP_WEIGHT = 0.7
+EPISODIC_WEIGHT = 0.25
+LIFELONG_WEIGHT = 0.05
 
 # LPM specific replay/buffer parameters
 ERROR_BUFFER_SIZE = MAX_ROLLOUT_FRAMES * 3
@@ -76,9 +79,9 @@ DYNAMICS_REPLAY_SIZE = MAX_ROLLOUT_FRAMES * 3
 ERROR_WARMUP = ERROR_BUFFER_SIZE // 2
 
 DYNAMICS_LEARNING_RATE = 1e-5
-ERROR_LEARNING_RATE = 5e-5
+ERROR_LEARNING_RATE = 1e-5
 DYNAMICS_GRAD_STEPS = 3
-ERROR_GRAD_STEPS = 6
+ERROR_GRAD_STEPS = 1
 
 LPM_HIDDEN = 512
 DYNAMICS_BATCH_SIZE = 512
@@ -196,6 +199,34 @@ class EpisodicNoveltyBuffer:
         else:
             tensor = torch.zeros_like(tensor)
         return tensor
+
+class LifelongNoveltyBuffer:
+    """Hash-based lifelong novelty tracker persisting across episodes."""
+    def __init__(self, num_bins=100, hash_dims=16):
+        self.visit_counts = {}
+        self.num_bins = num_bins
+        self.hash_dims = hash_dims
+        self.lock = threading.Lock()
+
+    def _hash(self, phi):
+        quantized = (phi * self.num_bins).astype(np.int32)
+        key = tuple(quantized[:self.hash_dims])
+        return key
+
+    def compute_novelty(self, phi):
+        key = self._hash(phi)
+        with self.lock:
+            count = self.visit_counts.get(key, 0)
+        return 1.0 / math.sqrt(count + 1)
+
+    def add(self, phi):
+        key = self._hash(phi)
+        with self.lock:
+            self.visit_counts[key] = self.visit_counts.get(key, 0) + 1
+
+    def unique_states(self):
+        with self.lock:
+            return len(self.visit_counts)
 
 # ============================================================================
 # Neural Network Components
@@ -398,35 +429,6 @@ class DynamicsReplayBuffer:
         next_obs_batch = torch.tensor(np.stack(self.next_obs[:batch_size]), dtype=torch.float32)
         return obs_batch, act_batch, next_obs_batch
 
-'''
-class ErrorReplayBuffer:
-    """Queue storing (obs, action, epsilon) tuples for error model training."""
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.storage = []
-    
-    def __len__(self): return len(self.storage)
-    
-    def extend(self, obs_batch, action_batch, epsilon_batch):
-        for o, a, e in zip(obs_batch, action_batch, epsilon_batch):
-            if len(self.storage) >= self.capacity:
-                self.storage.pop(0)
-
-            sample = (o.astype(np.uint8), int(a), float(e))
-            self.storage.append(sample)
-    
-    def sample(self, batch_size):
-        
-        # Shuffle list in-place to guarantee uniform random eviction
-        random.shuffle(self.storage)
-        
-        # Select first batch_size elements
-        obs_batch = torch.tensor(np.stack([self.storage[i][0] for i in range(batch_size)]), dtype=torch.float32)
-        act_batch = torch.tensor([self.storage[i][1] for i in range(batch_size)], dtype=torch.long)
-        eps_batch = torch.tensor([self.storage[i][2] for i in range(batch_size)], dtype=torch.float32)
-        return obs_batch, act_batch, eps_batch
-'''
-
 class ErrorReplayBuffer:
 
     """Queue storing (obs, action, epsilon) tuples for error model training."""
@@ -543,7 +545,7 @@ def stack_frames(frame_buffer, new_frame):
         return frame_buffer
        
 def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter,
-                error_ready, save_rgb_debug, device='cpu'):
+                error_ready, save_rgb_debug, lifelong_novelty, device='cpu'):
     game = vzd.DoomGame()
     # Get WAD path relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -552,7 +554,15 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         raise FileNotFoundError(f"Doom1.WAD not found at {wad_path}. Please place it in the repo root.")
     game.set_doom_game_path(wad_path)
     game.set_doom_map("E1M1")
-    game.set_render_hud(False)
+    game.set_render_hud(True)
+
+    game.set_kill_reward(1.0)
+    game.set_hit_reward(0.5)
+    game.set_armor_reward(0.1)
+    game.set_health_reward(0.1)
+    game.set_map_exit_reward(10.0)
+    game.set_secret_reward(5.0)
+
     game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
     game.set_window_visible(False)
     game.set_mode(vzd.Mode.PLAYER)
@@ -578,6 +588,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     rwds_e = []
     rwds_i = []
     novelties = []
+    lifelong_novelties = []
     learning_progresses = []
     dones = []
     epsilons = []
@@ -588,6 +599,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     frame_buffer = []  # For frame stacking
     novelty_counter = SKIP_FRAMES_NOVELTY - 1  # Ensure we compute novelty on first step
     last_novelty = 1.0
+    last_lifelong = 1.0
 
     # "Death is not the end" - continue across episode boundaries
     while frames_collected < MAX_FRAMES_PER_EPISODE:
@@ -598,6 +610,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
             novelty_buffer.reset()
             novelty_counter = SKIP_FRAMES_NOVELTY - 1
             last_novelty = 1.0
+            last_lifelong = 1.0
             continue
 
         state = game.get_state()
@@ -626,15 +639,24 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         with torch.no_grad():
             last_frame_t = torch.tensor(last_frame_t, dtype=torch.float32, device=device).unsqueeze(0)
             phi_t = encoder_model(last_frame_t)
+        phi_features = phi_t.squeeze(0)
 
         novelty_counter += 1
         if novelty_counter >= SKIP_FRAMES_NOVELTY:
-            episodic_novelty = novelty_buffer.compute_novelty(phi_t)
-            novelty_buffer.add(phi_t)
+            episodic_novelty = novelty_buffer.compute_novelty(phi_features)
+            novelty_buffer.add(phi_features)
+            phi_cpu = phi_features.detach().cpu().numpy()
+            norm = np.linalg.norm(phi_cpu)
+            if norm > 0:
+                phi_cpu = phi_cpu / norm
+            lifelong_nov = lifelong_novelty.compute_novelty(phi_cpu)
+            lifelong_novelty.add(phi_cpu)
             novelty_counter = 0
             last_novelty = episodic_novelty
+            last_lifelong = lifelong_nov
         else:
             episodic_novelty = last_novelty
+            lifelong_nov = last_lifelong
 
         with torch.no_grad():
             pred_next = dynamics_model(phi_t, act_onehot)
@@ -676,7 +698,11 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
             '''
 
         learning_progress = max(expected_error - epsilon, 0.0) if error_ready else 0.0
-        intrinsic_reward = 0.5 * learning_progress + 0.5 * episodic_novelty
+        intrinsic_reward = (
+            LP_WEIGHT * learning_progress +
+            EPISODIC_WEIGHT * episodic_novelty +
+            LIFELONG_WEIGHT * lifelong_nov
+        )
 
         # Store transition as uint8 to save memory
         obss.append(obs_stacked.astype(np.uint8))
@@ -693,6 +719,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         rwds_e.append(rwd_e)
         rwds_i.append(intrinsic_reward)
         novelties.append(episodic_novelty)
+        lifelong_novelties.append(lifelong_nov)
         learning_progresses.append(learning_progress)
         dones.append(done_flag)
         epsilons.append(epsilon)
@@ -727,6 +754,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
             rwds_i,
             epsilons,
             novelties,
+            lifelong_novelties,
             learning_progresses,
             dones,
             obss_rgb,
@@ -756,7 +784,7 @@ class FrameCounter:
             self.count = 0
 
 def run_parallel_episodes(n_threads, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter,
-                         error_ready, debug_thread_id, device='cpu'):
+                         error_ready, debug_thread_id, lifelong_novelty, device='cpu'):
     """
     Args:
         debug_thread_id: Only this thread will save RGB frames for debug
@@ -767,7 +795,8 @@ def run_parallel_episodes(n_threads, agent, dynamics_model, error_model, encoder
         save_rgb = (tid == debug_thread_id)  # Only one thread saves RGB
         t = threading.Thread(
             target=run_episode,
-            args=(tid, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter, error_ready, save_rgb, device)
+            args=(tid, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter,
+                  error_ready, save_rgb, lifelong_novelty, device)
         )
         t.start()
         threads.append(t)
@@ -830,7 +859,9 @@ def init_wandb(config):
 
 if __name__ == '__main__':
     torch.autograd.set_detect_anomaly(True)
-
+    import shutil
+    if os.path.isdir('debug'):
+        shutil.rmtree('debug')
     os.makedirs('debug', exist_ok=True)
 
     wandb_config = {
@@ -872,7 +903,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    cpus = 8#multiprocessing.cpu_count()
+    cpus = multiprocessing.cpu_count()-4
     n_threads_override = os.environ.get("LPM_THREADS")
     if n_threads_override is not None:
         try:
@@ -895,6 +926,7 @@ if __name__ == '__main__':
 
     dynamics_buffer = DynamicsReplayBuffer(DYNAMICS_REPLAY_SIZE)
     error_buffer = ErrorReplayBuffer(ERROR_BUFFER_SIZE)
+    lifelong_novelty = LifelongNoveltyBuffer(num_bins=100)
 
     intrinsic_rms = RewardRMS()
     intrinsic_stats = RunningStats()
@@ -921,6 +953,7 @@ if __name__ == '__main__':
         all_rwds_e_raw = []
         all_epsilons = []
         all_novelties = []
+        all_lifelong_nov = []
         all_learning_progress = []
         debug_episode_saved = False
         total_episodes = 0
@@ -932,13 +965,13 @@ if __name__ == '__main__':
         while frame_counter.get() < MAX_ROLLOUT_FRAMES:
             run_parallel_episodes(
                 n_threads, agent, dynamics_model, error_model, encoder_model,
-                buffer, stats, frame_counter, error_ready, debug_thread_id, device
+                buffer, stats, frame_counter, error_ready, debug_thread_id, lifelong_novelty, device
             )
 
             while not buffer.empty():
                 ep = buffer.get()
                 (thread_id, obss, obss_next, acts, logps, vals,
-                 rwds_e, rwds_i, epsilons_ep, novelties_ep, learning_progresses_ep, dones,
+                 rwds_e, rwds_i, epsilons_ep, novelties_ep, lifelong_nov_ep, learning_progresses_ep, dones,
                  obss_rgb, obss_next_rgb) = ep
                 total_episodes += 1
 
@@ -947,8 +980,8 @@ if __name__ == '__main__':
                     os.makedirs(debug_dir, exist_ok=True)
                     action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
                                     'ATTACK', 'USE', 'FWD_ATK', 'STRAFE_L', 'STRAFE_R']
-                    for i, (rgb_curr, rgb_next, act_idx, r_i, r_e, nov, lp) in enumerate(
-                        zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e, novelties_ep, learning_progresses_ep)
+                    for i, (rgb_curr, rgb_next, act_idx, r_i, r_e, nov, lifenov, lp) in enumerate(
+                        zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e, novelties_ep, lifelong_nov_ep, learning_progresses_ep)
                     ):
                         Image.fromarray(rgb_curr, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_current.png')
                         Image.fromarray(rgb_next, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_next.png')
@@ -958,6 +991,7 @@ if __name__ == '__main__':
                             f.write(f'Intrinsic Reward: {r_i:.6f}\\n')
                             f.write(f'Extrinsic Reward: {r_e:.3f}\\n')
                             f.write(f'Episodic Novelty: {nov:.6f}\\n')
+                            f.write(f'Lifelong Novelty: {lifenov:.6f}\\n')
                             f.write(f'Learning Progress: {lp:.6f}\\n')
 
                     print(f"Saved {len(obss_rgb)} RGB frame pairs to {debug_dir}/")
@@ -972,6 +1006,7 @@ if __name__ == '__main__':
                 rwds_i_ep = torch.tensor(rwds_i, dtype=torch.float32)
                 eps_ep = torch.tensor(epsilons_ep, dtype=torch.float32)
                 novelty_ep = torch.tensor(novelties_ep, dtype=torch.float32)
+                lifelong_ep = torch.tensor(lifelong_nov_ep, dtype=torch.float32)
                 learning_progress_ep = torch.tensor(learning_progresses_ep, dtype=torch.float32)
                 dones_ep = torch.tensor(dones, dtype=torch.bool)
 
@@ -1013,6 +1048,7 @@ if __name__ == '__main__':
                 all_dones.append(dones_ep)
                 all_epsilons.append(eps_ep)
                 all_novelties.append(novelty_ep)
+                all_lifelong_nov.append(lifelong_ep)
                 all_learning_progress.append(learning_progress_ep)
 
                 all_rwds_i_raw.extend(rwds_i)
@@ -1037,6 +1073,7 @@ if __name__ == '__main__':
         dones_t = torch.cat(all_dones, dim=0)
         eps_t = torch.cat(all_epsilons, dim=0)
         novelty_t = torch.cat(all_novelties, dim=0) if all_novelties else torch.empty(0, dtype=torch.float32)
+        lifelong_t = torch.cat(all_lifelong_nov, dim=0) if all_lifelong_nov else torch.empty(0, dtype=torch.float32)
         learning_progress_t = torch.cat(all_learning_progress, dim=0) if all_learning_progress else torch.empty(0, dtype=torch.float32)
 
         dynamics_buffer.extend(
@@ -1176,6 +1213,9 @@ if __name__ == '__main__':
         novelty_mean = novelty_t.mean().item() if novelty_t.numel() > 0 else 0.0
         novelty_std = novelty_t.std().item() if novelty_t.numel() > 0 else 0.0
         novelty_max = novelty_t.max().item() if novelty_t.numel() > 0 else 0.0
+        lifelong_mean = lifelong_t.mean().item() if lifelong_t.numel() > 0 else 0.0
+        lifelong_std = lifelong_t.std().item() if lifelong_t.numel() > 0 else 0.0
+        lifelong_max = lifelong_t.max().item() if lifelong_t.numel() > 0 else 0.0
         learning_progress_mean = learning_progress_t.mean().item() if learning_progress_t.numel() > 0 else 0.0
         learning_progress_std = learning_progress_t.std().item() if learning_progress_t.numel() > 0 else 0.0
         learning_progress_max = learning_progress_t.max().item() if learning_progress_t.numel() > 0 else 0.0
@@ -1198,6 +1238,9 @@ if __name__ == '__main__':
             "reward/novelty_mean": novelty_mean,
             "reward/novelty_std": novelty_std,
             "reward/novelty_max": novelty_max,
+            "reward/lifelong_novelty_mean": lifelong_mean,
+            "reward/lifelong_novelty_std": lifelong_std,
+            "reward/lifelong_novelty_max": lifelong_max,
             "reward/learning_progress_mean": learning_progress_mean,
             "reward/learning_progress_std": learning_progress_std,
             "reward/learning_progress_max": learning_progress_max,
@@ -1218,6 +1261,7 @@ if __name__ == '__main__':
             "data/dynamics_buffer": len(dynamics_buffer),
             "data/error_buffer": len(error_buffer),
             "data/error_ready": float(error_ready),
+            "data/unique_states_visited": lifelong_novelty.unique_states(),
             "lpm/epsilon_mean": eps_mean,
             "lpm/epsilon_std": eps_std,
             "lpm/epsilon_max": eps_max,

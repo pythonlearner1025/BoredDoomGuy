@@ -116,5 +116,7 @@ The outer loop serially performs PPO updates, then replay-driven training for dy
 
 ## 7. TODOs for future revision
 
+- [ ] Implement Random Network Distillation, OpenAI's solution
+
 - [ ] Add diagrams / reward curves once experiments stabilise.
 - [ ] Document best-known hyperparameter tweaks for Doom E1M1.

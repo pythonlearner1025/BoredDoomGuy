@@ -8,6 +8,7 @@ wandb/
 agent_playback/
 
 test/
+old_debugs/
 LPM_exploration/
 ViZDoom/
 screens/
