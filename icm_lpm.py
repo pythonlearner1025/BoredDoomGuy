@@ -49,20 +49,25 @@ GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
 GAE_LAMBDA = 0.95
 CLIP_COEF = 0.1
-ENT_COEF_START = 0.05   
-ENT_COEF_END = 0.001   
+ENT_COEF_START = 0.05
+ENT_COEF_END = 0.001
+ENT_COEF = ENT_COEF_START
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 MINIBATCH_SIZE = 2048
 LEARNING_RATE = 1e-4
 
-INTRINSIC_ONLY = FALSE  # If True, train with only intrinsic reward (no extrinsic)
-INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.5
-EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.5  # Set to 0.0 for pure curiosity (Burda et al.)
+INTRINSIC_ONLY = False  # If True, train with only intrinsic reward (no extrinsic)
+INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.7
+EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.3  # Allow sparse extrinsic reward to break ties
 IGNORE_DONES = True  # "Death is not the end" - infinite horizon bootstrapping
 FRAME_SKIP = 2
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
 ENCODER_FEATS = 512
+
+# Novelty
+SKIP_FRAMES_NOVELTY = 10  # Only update episodic novelty every N frame stacks
+NOVELTY_SIMILARITY_THRESH = 0.8
 
 # LPM specific replay/buffer parameters
 ERROR_BUFFER_SIZE = MAX_ROLLOUT_FRAMES * 3
@@ -100,6 +105,11 @@ MACRO_ACTIONS = [
     [vzd.Button.MOVE_LEFT],                      # 10: Strafe left
     [vzd.Button.MOVE_RIGHT],                     # 11: Strafe right
 ]
+
+BUTTONS_ORDER = sorted(
+    {btn for action in MACRO_ACTIONS for btn in action},
+    key=lambda b: b.value
+)
 
 # ============================================================================
 # Statistics Tracking
@@ -146,6 +156,46 @@ class RewardRMS:
 
     def std(self):
         return math.sqrt(self.mean2 / self.count)
+
+class EpisodicNoveltyBuffer:
+    """Lightweight episodic novelty tracker using cosine similarity in embedding space."""
+    def __init__(self, embedding_dim, similarity_threshold=0.9, device='cpu'):
+        self.similarity_threshold = similarity_threshold
+        self.device = torch.device(device)
+        self.embedding_dim = embedding_dim
+        self.states = torch.empty((0, embedding_dim), device=self.device)
+
+    def reset(self):
+        self.states = torch.empty((0, self.embedding_dim), device=self.device)
+
+    def compute_novelty(self, phi):
+        phi_vec = self._normalize(phi)
+        if phi_vec.numel() == 0:
+            return 0.0
+        if self.states.numel() == 0:
+            return 1.0
+        sims = torch.matmul(self.states, phi_vec)
+        visit_count = (sims > self.similarity_threshold).sum().item()
+        return 1.0 / math.sqrt(visit_count + 1)
+
+    def add(self, phi):
+        phi_vec = self._normalize(phi)
+        if phi_vec.numel() == 0:
+            return
+        self.states = torch.cat([self.states, phi_vec.unsqueeze(0)], dim=0)
+
+    def _normalize(self, phi):
+        if isinstance(phi, torch.Tensor):
+            tensor = phi.detach()
+        else:
+            tensor = torch.tensor(phi, dtype=torch.float32, device=self.device)
+        tensor = tensor.view(-1).to(self.device, dtype=torch.float32)
+        norm = torch.linalg.norm(tensor, ord=2)
+        if norm > 0:
+            tensor = tensor / norm
+        else:
+            tensor = torch.zeros_like(tensor)
+        return tensor
 
 # ============================================================================
 # Neural Network Components
@@ -508,14 +558,13 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     game.set_mode(vzd.Mode.PLAYER)
     game.add_game_args("+freelook 1")
 
-    # Set available buttons from macro actions
-    all_buttons = set()
-    for action in MACRO_ACTIONS:
-        all_buttons.update(action)
-    game.set_available_buttons(list(all_buttons))
+    # Set available buttons from macro actions (deterministic order)
+    game.set_available_buttons(BUTTONS_ORDER)
 
     game.init()
     game.new_episode()
+    novelty_buffer = EpisodicNoveltyBuffer(embedding_dim=ENCODER_FEATS, similarity_threshold=NOVELTY_SIMILARITY_THRESH, device=device)
+    novelty_buffer.reset()
 
     # Storage as uint8 to save memory
     obss = []  # Stacked frames (4, H, W) uint8 grayscale
@@ -528,6 +577,8 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     vals = []
     rwds_e = []
     rwds_i = []
+    novelties = []
+    learning_progresses = []
     dones = []
     epsilons = []
 
@@ -535,6 +586,8 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     n_actions = len(MACRO_ACTIONS)
     frames_collected = 0
     frame_buffer = []  # For frame stacking
+    novelty_counter = SKIP_FRAMES_NOVELTY - 1  # Ensure we compute novelty on first step
+    last_novelty = 1.0
 
     # "Death is not the end" - continue across episode boundaries
     while frames_collected < MAX_FRAMES_PER_EPISODE:
@@ -542,6 +595,9 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         if game.is_episode_finished():
             game.new_episode()
             frame_buffer = []  # Reset frame stack on new episode
+            novelty_buffer.reset()
+            novelty_counter = SKIP_FRAMES_NOVELTY - 1
+            last_novelty = 1.0
             continue
 
         state = game.get_state()
@@ -570,13 +626,24 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         with torch.no_grad():
             last_frame_t = torch.tensor(last_frame_t, dtype=torch.float32, device=device).unsqueeze(0)
             phi_t = encoder_model(last_frame_t)
+
+        novelty_counter += 1
+        if novelty_counter >= SKIP_FRAMES_NOVELTY:
+            episodic_novelty = novelty_buffer.compute_novelty(phi_t)
+            novelty_buffer.add(phi_t)
+            novelty_counter = 0
+            last_novelty = episodic_novelty
+        else:
+            episodic_novelty = last_novelty
+
+        with torch.no_grad():
             pred_next = dynamics_model(phi_t, act_onehot)
             expected_error_log = error_model(phi_t, act_onehot).item()
             expected_error = math.exp(expected_error_log)
 
         # Take action using macro action
         action_buttons = MACRO_ACTIONS[act_idx_item]
-        action_vector = [btn in action_buttons for btn in list(all_buttons)]
+        action_vector = [btn in action_buttons for btn in BUTTONS_ORDER]
         rwd_e = game.make_action(action_vector, FRAME_SKIP)
 
         # Get next state
@@ -608,7 +675,8 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
             epsilon = 0.0
             '''
 
-        intrinsic_reward = (expected_error - epsilon) if error_ready else 0.0
+        learning_progress = max(expected_error - epsilon, 0.0) if error_ready else 0.0
+        intrinsic_reward = 0.5 * learning_progress + 0.5 * episodic_novelty
 
         # Store transition as uint8 to save memory
         obss.append(obs_stacked.astype(np.uint8))
@@ -624,6 +692,8 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         vals.append(val.item())
         rwds_e.append(rwd_e)
         rwds_i.append(intrinsic_reward)
+        novelties.append(episodic_novelty)
+        learning_progresses.append(learning_progress)
         dones.append(done_flag)
         epsilons.append(epsilon)
 
@@ -645,7 +715,24 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     game.close()
 
     # Put episode data in buffer (include RGB frames for debug)
-    buffer.put((thread_id, obss, obss_next, acts, logps, vals, rwds_e, rwds_i, epsilons, dones, obss_rgb, obss_next_rgb))
+    buffer.put(
+        (
+            thread_id,
+            obss,
+            obss_next,
+            acts,
+            logps,
+            vals,
+            rwds_e,
+            rwds_i,
+            epsilons,
+            novelties,
+            learning_progresses,
+            dones,
+            obss_rgb,
+            obss_next_rgb,
+        )
+    )
 
 class FrameCounter:
     """Thread-safe frame counter."""
@@ -833,6 +920,8 @@ if __name__ == '__main__':
         all_rwds_i_raw = []
         all_rwds_e_raw = []
         all_epsilons = []
+        all_novelties = []
+        all_learning_progress = []
         debug_episode_saved = False
         total_episodes = 0
 
@@ -849,7 +938,7 @@ if __name__ == '__main__':
             while not buffer.empty():
                 ep = buffer.get()
                 (thread_id, obss, obss_next, acts, logps, vals,
-                 rwds_e, rwds_i, epsilons_ep, dones,
+                 rwds_e, rwds_i, epsilons_ep, novelties_ep, learning_progresses_ep, dones,
                  obss_rgb, obss_next_rgb) = ep
                 total_episodes += 1
 
@@ -858,8 +947,8 @@ if __name__ == '__main__':
                     os.makedirs(debug_dir, exist_ok=True)
                     action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
                                     'ATTACK', 'USE', 'FWD_ATK', 'STRAFE_L', 'STRAFE_R']
-                    for i, (rgb_curr, rgb_next, act_idx, r_i, r_e) in enumerate(
-                        zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e)
+                    for i, (rgb_curr, rgb_next, act_idx, r_i, r_e, nov, lp) in enumerate(
+                        zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e, novelties_ep, learning_progresses_ep)
                     ):
                         Image.fromarray(rgb_curr, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_current.png')
                         Image.fromarray(rgb_next, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_next.png')
@@ -868,6 +957,8 @@ if __name__ == '__main__':
                             f.write(f'Action: {action_name}\\n')
                             f.write(f'Intrinsic Reward: {r_i:.6f}\\n')
                             f.write(f'Extrinsic Reward: {r_e:.3f}\\n')
+                            f.write(f'Episodic Novelty: {nov:.6f}\\n')
+                            f.write(f'Learning Progress: {lp:.6f}\\n')
 
                     print(f"Saved {len(obss_rgb)} RGB frame pairs to {debug_dir}/")
                     debug_episode_saved = True
@@ -880,6 +971,8 @@ if __name__ == '__main__':
                 rwds_e_ep = torch.tensor(rwds_e, dtype=torch.float32)
                 rwds_i_ep = torch.tensor(rwds_i, dtype=torch.float32)
                 eps_ep = torch.tensor(epsilons_ep, dtype=torch.float32)
+                novelty_ep = torch.tensor(novelties_ep, dtype=torch.float32)
+                learning_progress_ep = torch.tensor(learning_progresses_ep, dtype=torch.float32)
                 dones_ep = torch.tensor(dones, dtype=torch.bool)
 
                 intrinsic_rms.update(rwds_i_ep)
@@ -919,6 +1012,8 @@ if __name__ == '__main__':
                 all_returns.append(rets_ep.squeeze(1))
                 all_dones.append(dones_ep)
                 all_epsilons.append(eps_ep)
+                all_novelties.append(novelty_ep)
+                all_learning_progress.append(learning_progress_ep)
 
                 all_rwds_i_raw.extend(rwds_i)
                 all_rwds_e_raw.extend(rwds_e)
@@ -941,6 +1036,8 @@ if __name__ == '__main__':
         returns = torch.cat(all_returns, dim=0)
         dones_t = torch.cat(all_dones, dim=0)
         eps_t = torch.cat(all_epsilons, dim=0)
+        novelty_t = torch.cat(all_novelties, dim=0) if all_novelties else torch.empty(0, dtype=torch.float32)
+        learning_progress_t = torch.cat(all_learning_progress, dim=0) if all_learning_progress else torch.empty(0, dtype=torch.float32)
 
         dynamics_buffer.extend(
             obs_t.cpu().numpy(),
@@ -1076,6 +1173,12 @@ if __name__ == '__main__':
         eps_std = eps_t.std().item() if len(eps_t) > 0 else 0.0
         eps_max = eps_t.max().item() if len(eps_t) > 0 else 0.0
         eps_min = eps_t.min().item() if len(eps_t) > 0 else 0.0
+        novelty_mean = novelty_t.mean().item() if novelty_t.numel() > 0 else 0.0
+        novelty_std = novelty_t.std().item() if novelty_t.numel() > 0 else 0.0
+        novelty_max = novelty_t.max().item() if novelty_t.numel() > 0 else 0.0
+        learning_progress_mean = learning_progress_t.mean().item() if learning_progress_t.numel() > 0 else 0.0
+        learning_progress_std = learning_progress_t.std().item() if learning_progress_t.numel() > 0 else 0.0
+        learning_progress_max = learning_progress_t.max().item() if learning_progress_t.numel() > 0 else 0.0
 
         log_dict = {
             "update_step": iter_idx + 1,
@@ -1092,6 +1195,12 @@ if __name__ == '__main__':
             "reward/extrinsic_batch_max": batch_max_e,
             "reward/extrinsic_batch_sum": batch_sum_e,
             "reward/total_batch": batch_total,
+            "reward/novelty_mean": novelty_mean,
+            "reward/novelty_std": novelty_std,
+            "reward/novelty_max": novelty_max,
+            "reward/learning_progress_mean": learning_progress_mean,
+            "reward/learning_progress_std": learning_progress_std,
+            "reward/learning_progress_max": learning_progress_max,
             "loss/policy": pi_loss,
             "loss/value": v_loss,
             "loss/entropy": -ent_loss,
