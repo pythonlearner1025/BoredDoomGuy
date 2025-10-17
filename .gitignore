@@ -7,6 +7,7 @@ Arnold/
 wandb/
 agent_playback/
 
+test/
 LPM_exploration/
 ViZDoom/
 screens/
