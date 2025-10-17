@@ -42,42 +42,47 @@ def get_env_int(name, default):
 # Hyperparameters
 # ============================================================================
 ITERS = get_env_int("LPM_ITERS", 1000)
-EPOCHS = 3  # INCREASED: More training iterations to learn bullet/wall dynamics thoroughly
-MAX_ROLLOUT_FRAMES = get_env_int("LPM_MAX_ROLLOUT_FRAMES", int(5e4))  # Reduced to avoid OOM
+EPOCHS = 4  # INCREASED: More training iterations to learn bullet/wall dynamics thoroughly
+MAX_ROLLOUT_FRAMES = get_env_int("LPM_MAX_ROLLOUT_FRAMES", int(3e4))  # Reduced to avoid OOM
 MAX_FRAMES_PER_EPISODE = get_env_int("LPM_MAX_FRAMES_PER_EPISODE", int(37.5*60*1))  # Per-thread 1 minute episode limit
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
 GAE_LAMBDA = 0.95
 CLIP_COEF = 0.1
-ENT_COEF = 0.01 # TODO inc this?  
+ENT_COEF = 0.01   
 VF_COEF = 0.5
 MAX_GRAD_NORM = 1.0
-MINIBATCH_SIZE = 1024
+MINIBATCH_SIZE = 2048
 LEARNING_RATE = 1e-4
-DYNAMICS_LEARNING_RATE = 1e-4
-ERROR_LEARNING_RATE = 5e-5
+
 INTRINSIC_ONLY = True  # If True, train with only intrinsic reward (no extrinsic)
 INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.5
 EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.5  # Set to 0.0 for pure curiosity (Burda et al.)
 IGNORE_DONES = True  # "Death is not the end" - infinite horizon bootstrapping
 FRAME_SKIP = 4
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
+ENCODER_FEATS = 512
 
 # LPM specific replay/buffer parameters
-ERROR_BUFFER_SIZE = 8192
+ERROR_BUFFER_SIZE = MAX_ROLLOUT_FRAMES * 1
+DYNAMICS_REPLAY_SIZE = MAX_ROLLOUT_FRAMES * 1
+
 ERROR_WARMUP = ERROR_BUFFER_SIZE // 2
-DYNAMICS_REPLAY_SIZE = int(1.5e4)
-DYNAMICS_BATCH_SIZE = 256
-ERROR_BATCH_SIZE = 256
-DYNAMICS_GRAD_STEPS = 4
-ERROR_GRAD_STEPS = 4
+
+DYNAMICS_LEARNING_RATE = 2e-4
+ERROR_LEARNING_RATE = 3e-4
+DYNAMICS_GRAD_STEPS = 10
+ERROR_GRAD_STEPS = 10
+
+LPM_HIDDEN = 512
+DYNAMICS_BATCH_SIZE = 512
+ERROR_BATCH_SIZE = 512
+
 EPSILON_CLAMP = 1e-6
 OBS_HEIGHT = 60
 OBS_WIDTH = 80
 OBS_CHANNELS = FRAME_STACK
 OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
-DRY_RUN = os.environ.get("LPM_DRY_RUN", "0") in {"1", "true", "True"}
-print(f"DRY RUN: {DRY_RUN}")
 
 # Macro actions for Doom E1M1 (no analog delta buttons)
 MACRO_ACTIONS = [
@@ -227,46 +232,66 @@ class LPMDynamicsModel(nn.Module):
     """Predicts next observation given current observation and action."""
     def __init__(self, n_actions, feat_dim=512, hidden=512):
         super().__init__()
-        self.encoder = ConvEncoder(OBS_CHANNELS, feat_dim)
         self.fc1 = nn.Linear(feat_dim + n_actions, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
-        self.fc_out = nn.Linear(hidden, OBS_SIZE)
+        self.fc_out = nn.Linear(hidden, feat_dim)
 
-    def forward(self, obs, act_onehot):
-        feats = self.encoder(obs)
+    def forward(self, phi_obs, act_onehot):
         if act_onehot.dim() == 1:
             act_onehot = act_onehot.unsqueeze(0)
         elif act_onehot.dim() > 2:
             act_onehot = act_onehot.view(act_onehot.size(0), -1)
-        z = torch.cat([feats, act_onehot], dim=-1)
+        z = torch.cat([phi_obs, act_onehot], dim=-1)
         z = F.relu(self.fc1(z))
         z = F.relu(self.fc2(z))
-        pred = torch.sigmoid(self.fc_out(z))
-        return pred.view(-1, OBS_CHANNELS, OBS_HEIGHT, OBS_WIDTH)
+        return self.fc_out(z)
 
 
 class LPMErrorModel(nn.Module):
     """Predicts expected previous log-MSE error for (obs, action)."""
-    def __init__(self, n_actions, feat_dim=512):
+    def __init__(self, n_actions, feat_dim=512, hidden=512):
         super().__init__()
-        self.encoder = ConvEncoder(OBS_CHANNELS, feat_dim)
         self.net = nn.Sequential(
-            nn.Linear(feat_dim + n_actions, 256),
+            nn.Linear(feat_dim + n_actions, hidden),
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(hidden, hidden//2),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(hidden//2, hidden//4),
+            nn.ReLU(),
+            nn.Linear(hidden//4, 1)
         )
 
-    def forward(self, obs, act_onehot):
-        feats = self.encoder(obs)
+    def forward(self, phi_obs, act_onehot):
         if act_onehot.dim() == 1:
             act_onehot = act_onehot.unsqueeze(0)
         elif act_onehot.dim() > 2:
             act_onehot = act_onehot.view(act_onehot.size(0), -1)
-        z = torch.cat([feats, act_onehot], dim=-1)
+        z = torch.cat([phi_obs, act_onehot], dim=-1)
         return self.net(z).squeeze(-1)
 
+# Random encoder sufficient for encoding states, from https://arxiv.org/pdf/1808.04355
+# Use RandomEncoder when computing phi_st_next, phi_st
+class RandomEncoder(nn.Module):
+    def __init__(self, in_ch=4, out_dim=512):  # 4 channels for frame stack
+        super().__init__()
+        # Use local RNG fork to avoid clobbering global seed
+        with torch.random.fork_rng():
+            torch.manual_seed(69)
+            self.net = get_cnn(in_ch, out_dim)
+
+        # Add batch norm for feature stability (Burda et al. Sec 2.2)
+        self.bn = nn.BatchNorm1d(out_dim, affine=False)
+        self.bn.eval()  # Keep in eval mode (running stats only, no learning)
+
+        # freeze random net
+        for p in self.net.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        x = x / 255.0
+        features = self.net(x)
+        features = self.bn(features)  # Normalize features for stable curiosity scale
+        return features
 
 class DynamicsReplayBuffer:
     """Fixed-size replay buffer storing transitions for dynamics training."""
@@ -299,20 +324,31 @@ class ErrorReplayBuffer:
     def __init__(self, capacity):
         from collections import deque
         self.capacity = capacity
-        self.storage = deque(maxlen=capacity)
+        self.ready = deque(maxlen=capacity)
+        self.pending = deque()
 
     def __len__(self):
-        return len(self.storage)
+        return len(self.ready)
 
     def extend(self, obs_batch, action_batch, epsilon_batch):
         for o, a, e in zip(obs_batch, action_batch, epsilon_batch):
-            self.storage.append((o.astype(np.uint8), int(a), float(e)))
+            sample = (o.astype(np.uint8), int(a), float(e))
+            self.pending.append(sample)
+            if len(self.pending) > self.capacity:
+                self.pending.popleft()
+
+    def commit_pending(self):
+        while self.pending:
+            self.ready.append(self.pending.popleft())
 
     def sample(self, batch_size):
-        idxs = np.random.choice(len(self.storage), size=batch_size, replace=False)
-        obs_batch = torch.tensor(np.stack([self.storage[i][0] for i in idxs]), dtype=torch.float32)
-        act_batch = torch.tensor([self.storage[i][1] for i in idxs], dtype=torch.long)
-        eps_batch = torch.tensor([self.storage[i][2] for i in idxs], dtype=torch.float32)
+        if len(self.ready) < batch_size:
+            raise ValueError("Not enough committed samples for error buffer")
+        storage = list(self.ready)
+        idxs = np.random.choice(len(storage), size=batch_size, replace=False)
+        obs_batch = torch.tensor(np.stack([storage[i][0] for i in idxs]), dtype=torch.float32)
+        act_batch = torch.tensor([storage[i][1] for i in idxs], dtype=torch.long)
+        eps_batch = torch.tensor([storage[i][2] for i in idxs], dtype=torch.float32)
         return obs_batch, act_batch, eps_batch
 
 # ============================================================================
@@ -395,101 +431,9 @@ def stack_frames(frame_buffer, new_frame):
     else:
         frame_buffer = frame_buffer[1:] + [gray_frame]  # Shift and append
         return frame_buffer
-
-def run_dummy_episode(thread_id, agent, dynamics_model, error_model, buffer, stats,
-                      frame_counter, error_ready, save_rgb_debug, device='cpu'):
-    """Generate synthetic transitions when VizDoom is unavailable."""
-    rwd_i_rms, rwd_e_rms = stats
-    n_actions = len(MACRO_ACTIONS)
-    obss = []
-    obss_next = []
-    acts = []
-    logps = []
-    vals = []
-    rwds_e = []
-    rwds_i = []
-    dones = []
-    epsilons = []
-    obss_rgb = [] if save_rgb_debug else None
-    obss_next_rgb = [] if save_rgb_debug else None
-
-    run_rwd_i = 0.0
-    run_rwd_e = 0.0
-    frames_collected = 0
-    steps = MAX_FRAMES_PER_EPISODE // FRAME_SKIP
-
-    for _ in range(steps):
-        obs_stacked = np.random.randint(
-            0, 256, size=(FRAME_STACK, OBS_HEIGHT, OBS_WIDTH), dtype=np.uint8
-        )
-        obs_t = torch.tensor(obs_stacked, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            logits, val = agent.forward(obs_t)
-            dist = torch.distributions.Categorical(logits=logits)
-            act_idx = dist.sample()
-            logp = dist.log_prob(act_idx)
-
-        act_idx_item = act_idx.item()
-        act_onehot = F.one_hot(act_idx, n_actions).float().unsqueeze(0)
-        with torch.no_grad():
-            pred_next = dynamics_model(obs_t, act_onehot)
-            expected_error = error_model(obs_t, act_onehot).item()
-
-        obs_next_stacked = np.random.randint(
-            0, 256, size=(FRAME_STACK, OBS_HEIGHT, OBS_WIDTH), dtype=np.uint8
-        )
-        obs_next_t = torch.tensor(obs_next_stacked, dtype=torch.float32, device=device).unsqueeze(0)
-        obs_next_norm = obs_next_t / 255.0
-        with torch.no_grad():
-            mse = F.mse_loss(pred_next, obs_next_norm, reduction='none')
-            mse_flat = mse.view(mse.shape[0], -1).mean(dim=1)
-            epsilon = torch.log(mse_flat + EPSILON_CLAMP).item()
-
-        intrinsic_reward = (expected_error - epsilon) if error_ready else 0.0
-        extrinsic_reward = float(np.random.randn() * 0.1)
-
-        obss.append(obs_stacked)
-        obss_next.append(obs_next_stacked)
-        acts.append(act_idx_item)
-        logps.append(logp.item())
-        vals.append(val.item())
-        rwds_e.append(extrinsic_reward)
-        rwds_i.append(intrinsic_reward)
-        epsilons.append(epsilon)
-        dones.append(False)
-
-        if save_rgb_debug:
-            rgb_dummy = np.repeat(obs_stacked[0:1], 3, axis=0).transpose(1, 2, 0)
-            rgb_dummy_next = np.repeat(obs_next_stacked[0:1], 3, axis=0).transpose(1, 2, 0)
-            obss_rgb.append(rgb_dummy.astype(np.uint8))
-            obss_next_rgb.append(rgb_dummy_next.astype(np.uint8))
-
-        frames_collected += FRAME_SKIP
-        run_rwd_i = run_rwd_i * GAMMA_INT + intrinsic_reward
-        run_rwd_e = run_rwd_e * GAMMA_EXT + extrinsic_reward
-
-    rwd_i_rms.update(run_rwd_i)
-    rwd_e_rms.update(run_rwd_e)
-    with frame_counter:
-        frame_counter.count += len(obss)
-
-    buffer.put(
-        (thread_id, obss, obss_next, acts, logps, vals,
-         rwds_e, rwds_i, epsilons, dones, obss_rgb, obss_next_rgb)
-    )
-
-
-def run_episode(thread_id, agent, dynamics_model, error_model, buffer, stats, frame_counter,
+       
+def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter,
                 error_ready, save_rgb_debug, device='cpu'):
-    if DRY_RUN:
-        return run_dummy_episode(
-            thread_id, agent, dynamics_model, error_model, buffer, stats,
-            frame_counter, error_ready, save_rgb_debug, device
-        )
-    """
-    Args:
-        save_rgb_debug: If True, save RGB frames for debug visualization
-    """
     game = vzd.DoomGame()
     # Get WAD path relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -561,8 +505,9 @@ def run_episode(thread_id, agent, dynamics_model, error_model, buffer, stats, fr
         act_idx_item = act_idx.item()
         act_onehot = F.one_hot(act_idx, n_actions).float().unsqueeze(0)
         with torch.no_grad():
-            pred_next = dynamics_model(obs_t, act_onehot)
-            expected_error = error_model(obs_t, act_onehot).item()
+            phi_t = encoder_model(obs_t)
+            pred_next = dynamics_model(phi_t, act_onehot)
+            expected_error = error_model(phi_t, act_onehot).item()
 
         # Take action using macro action
         action_buttons = MACRO_ACTIONS[act_idx_item]
@@ -582,8 +527,9 @@ def run_episode(thread_id, agent, dynamics_model, error_model, buffer, stats, fr
             # Compute intrinsic reward using full frame stack
             with torch.no_grad():
                 obs_next_t = torch.tensor(obs_next_stacked, dtype=torch.float32, device=device).unsqueeze(0)
-                obs_next_norm = obs_next_t / 255.0
-                mse = F.mse_loss(pred_next, obs_next_norm, reduction='none')
+                phi_next_t = encoder_model(obs_next_t)
+
+                mse = F.mse_loss(pred_next, phi_next_t, reduction='none')
             mse_flat = mse.view(mse.shape[0], -1).mean(dim=1)
             epsilon = torch.log(mse_flat + EPSILON_CLAMP).item()
         else:
@@ -651,7 +597,7 @@ class FrameCounter:
         with self.lock:
             self.count = 0
 
-def run_parallel_episodes(n_threads, agent, dynamics_model, error_model, buffer, stats, frame_counter,
+def run_parallel_episodes(n_threads, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter,
                          error_ready, debug_thread_id, device='cpu'):
     """
     Args:
@@ -663,7 +609,7 @@ def run_parallel_episodes(n_threads, agent, dynamics_model, error_model, buffer,
         save_rgb = (tid == debug_thread_id)  # Only one thread saves RGB
         t = threading.Thread(
             target=run_episode,
-            args=(tid, agent, dynamics_model, error_model, buffer, stats, frame_counter, error_ready, save_rgb, device)
+            args=(tid, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter, error_ready, save_rgb, device)
         )
         t.start()
         threads.append(t)
@@ -781,8 +727,9 @@ if __name__ == '__main__':
 
     n_actions = len(MACRO_ACTIONS)
     agent = Agent(n_actions).to(device)
-    dynamics_model = LPMDynamicsModel(n_actions).to(device)
-    error_model = LPMErrorModel(n_actions).to(device)
+    dynamics_model = LPMDynamicsModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
+    error_model = LPMErrorModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
+    encoder_model = RandomEncoder(out_dim=ENCODER_FEATS).to(device)
 
     agent_optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
     dynamics_optimizer = torch.optim.Adam(dynamics_model.parameters(), lr=DYNAMICS_LEARNING_RATE)
@@ -819,10 +766,11 @@ if __name__ == '__main__':
 
         dynamics_model.eval()
         error_model.eval()
+        encoder_model.eval()
 
         while frame_counter.get() < MAX_ROLLOUT_FRAMES:
             run_parallel_episodes(
-                n_threads, agent, dynamics_model, error_model,
+                n_threads, agent, dynamics_model, error_model, encoder_model,
                 buffer, stats, frame_counter, error_ready, debug_thread_id, device
             )
 
@@ -937,10 +885,13 @@ if __name__ == '__main__':
         total_v_loss = 0.0
         total_ent_loss = 0.0
         total_dynamics_loss = 0.0
-        total_error_loss = 0.0
+        error_loss_total = 0.0
         n_updates = 0
         dynamics_updates = 0
         error_updates = 0
+
+        eps_pred_total = 0.0
+        eps_actual_total = 0.0
 
         for epoch in range(EPOCHS):
             np.random.shuffle(indices)
@@ -966,11 +917,15 @@ if __name__ == '__main__':
                     break
                 obs_b, act_b, next_obs_b = dynamics_buffer.sample(DYNAMICS_BATCH_SIZE)
                 obs_b = obs_b.to(device)
+                next_obs_b = next_obs_b.to(device)
                 act_onehot = F.one_hot(act_b.to(device), n_actions).float()
-                next_obs_b = next_obs_b.to(device) / 255.0
 
-                pred_next = dynamics_model(obs_b, act_onehot)
-                dyn_loss = F.mse_loss(pred_next, next_obs_b)
+                with torch.no_grad():
+                    phi_obs = encoder_model(obs_b)
+                    phi_next = encoder_model(next_obs_b)
+
+                pred_next = dynamics_model(phi_obs, act_onehot)
+                dyn_loss = F.mse_loss(pred_next, phi_next)
 
                 dynamics_optimizer.zero_grad(set_to_none=True)
                 dyn_loss.backward()
@@ -988,7 +943,10 @@ if __name__ == '__main__':
                 act_onehot = F.one_hot(act_b.to(device), n_actions).float()
                 eps_b = eps_b.to(device)
 
-                eps_pred = error_model(obs_b, act_onehot)
+                with torch.no_grad():
+                    phi_obs = encoder_model(obs_b)
+
+                eps_pred = error_model(phi_obs, act_onehot)
                 err_loss = F.mse_loss(eps_pred, eps_b)
 
                 error_optimizer.zero_grad(set_to_none=True)
@@ -996,8 +954,11 @@ if __name__ == '__main__':
                 nn.utils.clip_grad_norm_(error_model.parameters(), MAX_GRAD_NORM)
                 error_optimizer.step()
 
-                total_error_loss += err_loss.item()
+                error_loss_total += err_loss.item()
                 error_updates += 1
+
+                eps_pred_total += eps_pred.mean().item()
+                eps_actual_total += eps_b.mean().item()
 
             epoch_end = time.time()
             print(f"EPOCH {epoch} took {(epoch_end - epoch_start):0.2f}s")
@@ -1006,7 +967,10 @@ if __name__ == '__main__':
         v_loss = total_v_loss / max(n_updates, 1)
         ent_loss = total_ent_loss / max(n_updates, 1)
         dynamics_loss = total_dynamics_loss / max(dynamics_updates, 1) if dynamics_updates else 0.0
-        error_loss = total_error_loss / max(error_updates, 1) if error_updates else 0.0
+        # log these to track error prediction sanity
+        error_loss_mean = error_loss_total / max(error_updates, 1) if error_updates else 0.0
+        error_pred_mean = eps_pred_total / max(error_updates, 1) if error_updates else 0.0
+        error_actual_mean = eps_actual_total / max(error_updates, 1) if error_updates else 0.0
 
         iter_time = time.time() - iter_start
         _, mean_i_running, std_i_running = rwd_i_rms.get()
@@ -1049,7 +1013,12 @@ if __name__ == '__main__':
             "loss/value": v_loss,
             "loss/entropy": -ent_loss,
             "loss/dynamics": dynamics_loss,
-            "loss/error_model": error_loss,
+
+            # error stuff
+            "loss/error_model": error_loss_mean,
+            "lpm/error_pred": error_pred_mean,
+            "lpm/error_actual": error_actual_mean,
+
             "time/iteration_time": iter_time,
             "time/fps": frame_counter.get() / iter_time,
             "data/episodes_collected": total_episodes,
@@ -1063,11 +1032,18 @@ if __name__ == '__main__':
             "lpm/epsilon_min": eps_min,
         }
 
+        for k,v in log_dict.items():
+            print(k, ": ", v)
+
+
         wandb.log(log_dict)
+
+        # make newly collected errors available for the next iteration
+        error_buffer.commit_pending()
 
         print(f"Time: {iter_time:.1f}s | FPS: {frame_counter.get()/iter_time:.0f}")
         print(f"Policy Loss: {pi_loss:.4f}, Value Loss: {v_loss:.4f}, Entropy: {-ent_loss:.4f}")
-        print(f"Dynamics Loss: {dynamics_loss:.6f}, Error Model Loss: {error_loss:.6f}")
+        print(f"Dynamics Loss: {dynamics_loss:.6f}, Error Model Loss: {error_loss_mean:.6f}")
         print(f"Intrinsic (batch): μ={batch_mean_i:.6f}, σ={batch_std_i:.6f}, max={batch_max_i:.6f}")
         print(f"Extrinsic (batch): μ={batch_mean_e:.3f}, max={batch_max_e:.3f}, sum={batch_sum_e:.1f}")
         if INTRINSIC_ONLY:

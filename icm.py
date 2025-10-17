@@ -8,6 +8,7 @@ import os
 import math
 import time
 import torch
+import random
 import threading
 import multiprocessing
 import torch.nn as nn
@@ -24,32 +25,37 @@ from vizdoom import ScreenFormat
 from vizdoom import ScreenResolution
 import vizdoom as vzd
 
+os.environ['OMP_NUM_THREADS'] = '1'  # Prevent OpenMP conflicts
+os.environ['MKL_NUM_THREADS'] = '1'  # Prevent MKL conflicts
 # ============================================================================
 # Hyperparameters
 # ============================================================================
-ITERS = 100
-EPOCHS = 15  # INCREASED: More training iterations to learn bullet/wall dynamics thoroughly
-MAX_ROLLOUT_FRAMES = int(1e4)  # Reduced to avoid OOM
+ITERS = 1000
+EPOCHS = 3  # INCREASED: More training iterations to learn bullet/wall dynamics thoroughly
+MAX_ROLLOUT_FRAMES = int(3e4)  # Reduced to avoid OOM
 MAX_FRAMES_PER_EPISODE = int(37.5*60*1)  # Per-thread 1 minute episode limit
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
 GAE_LAMBDA = 0.95
 CLIP_COEF = 0.1
-ENT_COEF = 0.01
+ENT_COEF = 0.01 # TODO inc this?  
 VF_COEF = 0.5
-MAX_GRAD_NORM = 0.5
-MINIBATCH_SIZE = 512
+MAX_GRAD_NORM = 1.0
+MINIBATCH_SIZE = 1024
 LEARNING_RATE = 1e-4
-FWD_LEARNING_RATE = 3e-4  # Higher LR for forward model to learn dynamics faster
-INTRINSIC_COEF = 1.0
-EXTRINSIC_COEF = 0.0  # Set to 0.0 for pure curiosity (Burda et al.)
+FWD_LEARNING_RATE = 1e-4  # Higher LR for forward model to learn dynamics faster
 INTRINSIC_ONLY = True  # If True, train with only intrinsic reward (no extrinsic)
+INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.5
+EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.5  # Set to 0.0 for pure curiosity (Burda et al.)
 IGNORE_DONES = True  # "Death is not the end" - infinite horizon bootstrapping
 USE_INVERSE_DYNAMICS = True  # If True, use trainable encoder with IDM loss (Pathak et al.)
+FWD_ENC_COEF = 0.25
 FEAT_DIM = 512
-FWD_HIDDEN = 1024  # INCREASED: Larger forward model to memorize bullet/wall dynamics
+FWD_HIDDEN = 1024  # DONE Larger forward model to memorize bullet/wall dynamics
+FWD_LAYERS = 2
+
 IDM_HIDDEN = 512  # Hidden size for inverse dynamics model
-FEAT_LEARNING_RATE = 1e-4  # Learning rate for trainable feature encoder
+FEAT_LEARNING_RATE = 1e-5  # DONE Lower learning rate for stability 
 FRAME_SKIP = 4
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
 
@@ -166,7 +172,6 @@ class Agent(nn.Module):
 
 # Random encoder sufficient for encoding states, from https://arxiv.org/pdf/1808.04355
 # Use RandomEncoder when computing phi_st_next, phi_st
-# NOTE: Encodes only CURRENT frame (not frame stack) to avoid trivial prediction
 class RandomEncoder(nn.Module):
     def __init__(self, in_ch=4, out_dim=512):  # 4 channels for frame stack
         super().__init__()
@@ -222,20 +227,68 @@ class InverseDynamicsModel(nn.Module):
         z = F.relu(self.fc2(z))
         return self.fc3(z)  # Logits for action prediction
 
+'''
 # Forward dynamics model: f(phi(s), a) -> phi(s')
+# TODO FDM loss steadily increases and tied to intrinsic rwd - maybe inc capacity?
 class ForwardDynamicsModel(nn.Module):
     def __init__(self, feat_dim, n_actions, hidden=1024):
         super().__init__()
         # Deeper network to better memorize stochastic dynamics (bullet holes, particles)
         self.fc1 = nn.Linear(feat_dim + n_actions, hidden)
-        self.fc2 = nn.Linear(hidden, hidden)
-        self.fc3 = nn.Linear(hidden, feat_dim)
+        self.blocks = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(FWD_LAYERS)])
+        self.fc_head = nn.Linear(hidden, feat_dim)
 
     def forward(self, phi_s, a_onehot):
         z = torch.cat([phi_s, a_onehot], dim=-1)
         z = F.relu(self.fc1(z))
-        z = F.relu(self.fc2(z))  # Extra layer for more capacity
-        return self.fc3(z)  # mean of Gaussian with fixed variance
+        for block in self.blocks:
+            z = F.relu(block(z))
+        return self.fc_head(z)  # mean of Gaussian with fixed variance
+
+'''
+class ForwardDynamicsModel(nn.Module):
+    def __init__(self, feat_dim, n_actions, hidden=1024, gru_hidden=512):
+        super().__init__()
+        # Larger first layer to process state+action
+        self.fc1 = nn.Linear(feat_dim + n_actions, hidden)
+        
+        # GRU to maintain temporal context (memory of recent states/actions)
+        self.gru = nn.GRU(hidden, gru_hidden, batch_first=True)
+        self.gru_hidden = None  # Will store hidden state across forward passes
+        
+        # Deeper network with more capacity
+        self.fc2 = nn.Linear(hidden + gru_hidden, hidden)
+        self.fc3 = nn.Linear(hidden, hidden)
+        self.fc4 = nn.Linear(hidden, feat_dim)
+        
+    def forward(self, phi_s, a_onehot):
+        batch_size = phi_s.shape[0]
+        device = phi_s.device
+        
+        # Process current state-action pair
+        z = torch.cat([phi_s, a_onehot], dim=-1)
+        z = F.relu(self.fc1(z))
+        
+        # Pass through GRU to get temporal context
+        z_seq = z.unsqueeze(1)  # Add sequence dimension for GRU
+        # Initialize or resize hidden state if needed
+        if self.gru_hidden is None or self.gru_hidden.shape[1] != batch_size:
+            self.gru_hidden = torch.zeros(1, batch_size, 512).to(device)
+        
+        gru_out, self.gru_hidden = self.gru(z_seq, self.gru_hidden.detach())
+        gru_features = gru_out.squeeze(1)
+        
+        # Combine current features with temporal context
+        combined = torch.cat([z, gru_features], dim=-1)
+        
+        # Process through deeper layers
+        z = F.relu(self.fc2(combined))
+        z = F.relu(self.fc3(z))
+        return self.fc4(z)
+    
+    def reset_hidden(self):
+        """Call this at episode boundaries to reset GRU memory"""
+        self.gru_hidden = None
 
 # ============================================================================
 # GAE Computation
@@ -310,7 +363,12 @@ def stack_frames(frame_buffer, new_frame):
         frame_buffer = frame_buffer[1:] + [gray_frame]  # Shift and append
         return frame_buffer
 
-def run_episode(thread_id, agent, fwd_model, phi_enc, buffer, stats, frame_counter, device='cpu'):
+def run_episode(thread_id, agent, fwd_model, phi_enc, buffer, stats, frame_counter,
+                save_rgb_debug, device='cpu'):
+    """
+    Args:
+        save_rgb_debug: If True, save RGB frames for debug visualization
+    """
     game = vzd.DoomGame()
     # Get WAD path relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -337,8 +395,9 @@ def run_episode(thread_id, agent, fwd_model, phi_enc, buffer, stats, frame_count
     # Storage as uint8 to save memory
     obss = []  # Stacked frames (4, H, W) uint8 grayscale
     obss_next = []
-    obss_rgb = []  # RGB frames for debug visualization (H, W, 3)
-    obss_next_rgb = []
+    # Only save RGB if this thread is selected for debug (HUGE memory savings)
+    obss_rgb = [] if save_rgb_debug else None
+    obss_next_rgb = [] if save_rgb_debug else None
     acts = []
     logps = []
     vals = []
@@ -415,8 +474,12 @@ def run_episode(thread_id, agent, fwd_model, phi_enc, buffer, stats, frame_count
         # Store transition as uint8 to save memory
         obss.append(obs_stacked.astype(np.uint8))
         obss_next.append(obs_next_stacked.astype(np.uint8))
-        obss_rgb.append(raw_frame_hwc)  # Store RGB for debug visualization
-        obss_next_rgb.append(raw_frame_next_hwc)
+
+        # Only store RGB if this thread is saving debug frames (saves ~1.7GB)
+        if save_rgb_debug:
+            obss_rgb.append(raw_frame_hwc)
+            obss_next_rgb.append(raw_frame_next_hwc)
+
         acts.append(act_idx_item)
         logps.append(logp.item())
         vals.append(val.item())
@@ -465,13 +528,19 @@ class FrameCounter:
         with self.lock:
             self.count = 0
 
-def run_parallel_episodes(n_threads, agent, fwd_model, phi_enc, buffer, stats, frame_counter, device='cpu'):
+def run_parallel_episodes(n_threads, agent, fwd_model, phi_enc, buffer, stats, frame_counter,
+                         debug_thread_id, device='cpu'):
+    """
+    Args:
+        debug_thread_id: Only this thread will save RGB frames for debug
+    """
     threads = []
 
     for tid in range(n_threads):
+        save_rgb = (tid == debug_thread_id)  # Only one thread saves RGB
         t = threading.Thread(
             target=run_episode,
-            args=(tid, agent, fwd_model, phi_enc, buffer, stats, frame_counter, device)
+            args=(tid, agent, fwd_model, phi_enc, buffer, stats, frame_counter, save_rgb, device)
         )
         t.start()
         threads.append(t)
@@ -523,6 +592,9 @@ def ppo_update(agent, optimizer, obs_batch, act_batch, old_logp_batch,
 # Main Training Loop
 # ============================================================================
 if __name__ == '__main__':
+    # Enable anomaly detection to find in-place operations
+    torch.autograd.set_detect_anomaly(True)
+
     # Create debug directory
     os.makedirs('debug', exist_ok=True)
 
@@ -566,7 +638,7 @@ if __name__ == '__main__':
     print(f"Using device: {device}")
 
     # Check number of cpu cores
-    cpus = 10#int(multiprocessing.cpu_count() * 1)
+    cpus = 8#int(multiprocessing.cpu_count() * 1)
     n_threads = max(1, cpus - 2)
     print(f"Using {n_threads} worker threads")
 
@@ -607,51 +679,14 @@ if __name__ == '__main__':
         print(f"\n=== Iteration {iter_idx+1}/{ITERS} ===")
         iter_start = time.time()
 
-        # Collect rollouts
+        # Collect rollouts with incremental processing
         buffer = Queue()
         frame_counter = FrameCounter()
 
-        while frame_counter.get() < MAX_ROLLOUT_FRAMES:
-            run_parallel_episodes(n_threads, agent, fwd_model, phi_enc, buffer, stats, frame_counter, device)
+        # Pick one random thread to save RGB debug frames
+        debug_thread_id = random.randint(0, n_threads - 1)
 
-        # Extract all episodes from buffer
-        episodes = []
-        while not buffer.empty():
-            episodes.append(buffer.get())
-
-        print(f"Collected {len(episodes)} episodes, {frame_counter.get()} frames")
-
-        # Visual debugging: save all RGB frames from a randomly selected episode
-        if len(episodes) > 0:
-            import random
-            debug_ep_idx = random.randint(0, len(episodes) - 1)
-            debug_ep = episodes[debug_ep_idx]
-            thread_id, obss, obss_next, acts, logps, vals, rwds_e, rwds_i, dones, obss_rgb, obss_next_rgb = debug_ep
-
-            # Create debug directory for this iteration
-            debug_dir = f'debug/iter_{iter_idx+1:04d}'
-            os.makedirs(debug_dir, exist_ok=True)
-
-            # Action names for debugging
-            action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
-                           'ATTACK', 'USE', 'FWD_ATK', 'STRAFE_L', 'STRAFE_R']
-
-            # Save all frame pairs from this episode (RGB for better visualization)
-            for i, (rgb_curr, rgb_next, act_idx, r_i, r_e) in enumerate(zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e)):
-                # Save RGB frames directly
-                Image.fromarray(rgb_curr, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_current.png')
-                Image.fromarray(rgb_next, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_next.png')
-
-                # Save action and rewards as txt file with metadata
-                action_name = action_names[act_idx] if act_idx < len(action_names) else f'ACT_{act_idx}'
-                with open(f'{debug_dir}/frame_{i:04d}_{action_name}.txt', 'w') as f:
-                    f.write(f'Action: {action_name}\n')
-                    f.write(f'Intrinsic Reward: {r_i:.6f}\n')
-                    f.write(f'Extrinsic Reward: {r_e:.3f}\n')
-
-            print(f"Saved {len(obss_rgb)} RGB frame pairs to {debug_dir}/")
-
-        # Compute GAE per episode, then flatten
+        # Accumulate processed data incrementally to save memory
         all_obs = []
         all_obs_next = []
         all_acts = []
@@ -659,67 +694,95 @@ if __name__ == '__main__':
         all_advantages = []
         all_returns = []
         all_dones = []
+        all_rwds_i_raw = []  # Store raw rewards for batch statistics
+        all_rwds_e_raw = []
+        debug_episode_saved = False
+        total_episodes = 0
 
-        for ep in episodes:
-            # Unpack episode (RGB frames at the end, we don't need them for training)
-            thread_id, obss, obss_next, acts, logps, vals, rwds_e, rwds_i, dones, obss_rgb, obss_next_rgb = ep
+        while frame_counter.get() < MAX_ROLLOUT_FRAMES:
+            run_parallel_episodes(n_threads, agent, fwd_model, phi_enc, buffer, stats,
+                                frame_counter, debug_thread_id, device)
 
-            # Convert to tensors (keep as uint8 for obs to save memory)
-            obs_ep = torch.tensor(np.array(obss), dtype=torch.uint8)  # uint8!
-            obs_next_ep = torch.tensor(np.array(obss_next), dtype=torch.uint8)
-            acts_ep = torch.tensor(acts, dtype=torch.long)
-            logps_ep = torch.tensor(logps, dtype=torch.float32)
-            vals_ep = torch.tensor(vals, dtype=torch.float32)
-            rwds_e_ep = torch.tensor(rwds_e, dtype=torch.float32)
-            rwds_i_ep = torch.tensor(rwds_i, dtype=torch.float32)
-            dones_ep = torch.tensor(dones, dtype=torch.bool)
+            # Process episodes immediately as they arrive (don't accumulate)
+            while not buffer.empty():
+                ep = buffer.get()
+                thread_id, obss, obss_next, acts, logps, vals, rwds_e, rwds_i, dones, obss_rgb, obss_next_rgb = ep
+                total_episodes += 1
 
-            # Normalize rewards using running stats
-            _, _, std_i = rwd_i_rms.get()
-            _, _, std_e = rwd_e_rms.get()
+                # Save debug frames from the selected thread (only once)
+                if thread_id == debug_thread_id and not debug_episode_saved and obss_rgb is not None:
+                    debug_dir = f'debug/iter_{iter_idx+1:04d}'
+                    os.makedirs(debug_dir, exist_ok=True)
+                    action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
+                                   'ATTACK', 'USE', 'FWD_ATK', 'STRAFE_L', 'STRAFE_R']
 
-            rwds_i_norm = rwds_i_ep / max(std_i if not math.isnan(std_i) else 1.0, 1e-3)
-            rwds_e_norm = rwds_e_ep / max(std_e if not math.isnan(std_e) else 1.0, 1e-3)
+                    for i, (rgb_curr, rgb_next, act_idx, r_i, r_e) in enumerate(zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e)):
+                        Image.fromarray(rgb_curr, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_current.png')
+                        Image.fromarray(rgb_next, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_next.png')
+                        action_name = action_names[act_idx] if act_idx < len(action_names) else f'ACT_{act_idx}'
+                        with open(f'{debug_dir}/frame_{i:04d}_{action_name}.txt', 'w') as f:
+                            f.write(f'Action: {action_name}\n')
+                            f.write(f'Intrinsic Reward: {r_i:.6f}\n')
+                            f.write(f'Extrinsic Reward: {r_e:.3f}\n')
 
-            # Mix rewards (zero out extrinsic if INTRINSIC_ONLY)
-            if INTRINSIC_ONLY:
-                total_rwds_ep = INTRINSIC_COEF * rwds_i_norm
-            else:
+                    print(f"Saved {len(obss_rgb)} RGB frame pairs to {debug_dir}/")
+                    debug_episode_saved = True
+
+                # Convert episode to tensors (uint8 for memory efficiency)
+                obs_ep = torch.tensor(np.array(obss), dtype=torch.uint8)
+                obs_next_ep = torch.tensor(np.array(obss_next), dtype=torch.uint8)
+                acts_ep = torch.tensor(acts, dtype=torch.long)
+                logps_ep = torch.tensor(logps, dtype=torch.float32)
+                vals_ep = torch.tensor(vals, dtype=torch.float32)
+                rwds_e_ep = torch.tensor(rwds_e, dtype=torch.float32)
+                rwds_i_ep = torch.tensor(rwds_i, dtype=torch.float32)
+                dones_ep = torch.tensor(dones, dtype=torch.bool)
+
+                # Normalize rewards using running stats
+                _, _, std_i = rwd_i_rms.get()
+                _, _, std_e = rwd_e_rms.get()
+
+                rwds_i_norm = rwds_i_ep / max(std_i if not math.isnan(std_i) else 1.0, 1e-3)
+                rwds_e_norm = rwds_e_ep / max(std_e if not math.isnan(std_e) else 1.0, 1e-3)
+
                 total_rwds_ep = EXTRINSIC_COEF * rwds_e_norm + INTRINSIC_COEF * rwds_i_norm
 
-            # Bootstrap value from NEXT state (not current)
-            with torch.no_grad():
-                if IGNORE_DONES or not dones_ep[-1]:
-                    # Use last next_obs for bootstrap (full stack for policy)
-                    obs_next_last = obs_next_ep[-1].float().to(device).unsqueeze(0)
-                    _, next_val = agent.forward(obs_next_last)
-                    next_val = next_val[0].cpu()
-                else:
-                    next_val = torch.tensor(0.0)
+                # Bootstrap value from NEXT state
+                with torch.no_grad():
+                    if IGNORE_DONES or not dones_ep[-1]:
+                        obs_next_last = obs_next_ep[-1].float().to(device).unsqueeze(0)
+                        _, next_val = agent.forward(obs_next_last)
+                        next_val = next_val[0].cpu()
+                    else:
+                        next_val = torch.tensor(0.0)
 
-            # Compute GAE with IGNORE_DONES flag
-            advs_ep, rets_ep = compute_gae(
-                total_rwds_ep.unsqueeze(1),  # (T, 1)
-                vals_ep.unsqueeze(1),         # (T, 1)
-                dones_ep.unsqueeze(1),        # (T, 1)
-                next_val.unsqueeze(0),        # (1,)
-                GAMMA_EXT,
-                GAE_LAMBDA,
-                ignore_dones=IGNORE_DONES
-            )
+                # Compute GAE with IGNORE_DONES flag
+                advs_ep, rets_ep = compute_gae(
+                    total_rwds_ep.unsqueeze(1),
+                    vals_ep.unsqueeze(1),
+                    dones_ep.unsqueeze(1),
+                    next_val.unsqueeze(0),
+                    GAMMA_EXT,
+                    GAE_LAMBDA,
+                    ignore_dones=IGNORE_DONES
+                )
 
-            # Flatten back to (T,)
-            advs_ep = advs_ep.squeeze(1)
-            rets_ep = rets_ep.squeeze(1)
+                # Flatten and accumulate immediately
+                all_obs.append(obs_ep)
+                all_obs_next.append(obs_next_ep)
+                all_acts.append(acts_ep)
+                all_logps.append(logps_ep)
+                all_advantages.append(advs_ep.squeeze(1))
+                all_returns.append(rets_ep.squeeze(1))
+                all_dones.append(dones_ep)
 
-            # Accumulate
-            all_obs.append(obs_ep)
-            all_obs_next.append(obs_next_ep)
-            all_acts.append(acts_ep)
-            all_logps.append(logps_ep)
-            all_advantages.append(advs_ep)
-            all_returns.append(rets_ep)
-            all_dones.append(dones_ep)
+                # Store raw rewards for batch statistics
+                all_rwds_i_raw.extend(rwds_i)
+                all_rwds_e_raw.extend(rwds_e)
+
+                # Free memory immediately
+                del ep, obss, obss_next, obss_rgb, obss_next_rgb
+        print(f"Collected {total_episodes} episodes, {frame_counter.get()} frames")
 
         # Concatenate all episodes (keep on CPU, uint8 for obs)
         obs_t = torch.cat(all_obs, dim=0)  # uint8
@@ -744,7 +807,7 @@ if __name__ == '__main__':
 
         for epoch in range(EPOCHS):
             np.random.shuffle(indices)
-
+            e = time.time()
             for start in range(0, n_samples, MINIBATCH_SIZE):
                 end = min(start + MINIBATCH_SIZE, n_samples)
                 mb_idx = indices[start:end]
@@ -768,35 +831,59 @@ if __name__ == '__main__':
                 phi_s = phi_enc(mb_obs_stack)
                 phi_s_next = phi_enc(mb_obs_next_stack)
 
-                # Forward dynamics loss (train forward model to predict next features)
+                # Compute both forward and inverse losses first, then update models
+                # This prevents double-backpropagation through the same computational graph
+
                 act_onehot = F.one_hot(mb_acts, n_actions).float()
-                phi_pred = fwd_model(phi_s.detach() if USE_INVERSE_DYNAMICS else phi_s, act_onehot)
 
-                # Detach phi_s_next as target (no gradients needed)
+                # Forward dynamics loss (train forward model to predict next features)
+                phi_pred = fwd_model(phi_s.detach(), act_onehot)
                 per_sample_fwd = F.mse_loss(phi_pred, phi_s_next.detach(), reduction='none').mean(dim=1)
-                fwd_loss_val = (per_sample_fwd * mb_not_terminal).sum() / (mb_not_terminal.sum().clamp_min(1))
-
-                # Backward for forward model
-                fwd_optimizer.zero_grad()
-                fwd_loss_val.backward()
-                fwd_optimizer.step()
-
-                fwd_loss = fwd_loss_val.item()
+                if IGNORE_DONES:
+                    fwd_loss_val = per_sample_fwd.mean()
+                else:
+                    fwd_loss_val = (per_sample_fwd * mb_not_terminal).sum() / (mb_not_terminal.sum().clamp_min(1))
 
                 # Inverse dynamics loss (train encoder to extract action-relevant features)
                 idm_loss = 0.0
                 if USE_INVERSE_DYNAMICS:
-                    # Predict action from (phi_s, phi_s_next)
-                    action_logits = idm_model(phi_s, phi_s_next)
-                    idm_loss_val = F.cross_entropy(action_logits, mb_acts, reduction='none')
-                    idm_loss_val = (idm_loss_val * mb_not_terminal).sum() / (mb_not_terminal.sum().clamp_min(1))
+                    # Recompute features for inverse dynamics to ensure fresh graph
+                    phi_s_idm = phi_enc(mb_obs_stack)
+                    phi_s_next_idm = phi_enc(mb_obs_next_stack)
 
-                    # Backward for encoder + IDM
-                    feat_idm_optimizer.zero_grad()
-                    idm_loss_val.backward()
+                    # Predict action from (phi_s, phi_s_next)
+                    action_logits = idm_model(phi_s_idm, phi_s_next_idm)
+                    idm_loss_val = F.cross_entropy(action_logits, mb_acts, reduction='none')
+                    if IGNORE_DONES:
+                        idm_loss_val = idm_loss_val.mean()
+                    else:
+                        idm_loss_val = (idm_loss_val * mb_not_terminal).sum() / (mb_not_terminal.sum().clamp_min(1))
+
+                    # Forward dynamics loss for encoder (part of joint optimization)
+                    phi_pred_enc = fwd_model(phi_s_idm, act_onehot)
+                    per_sample_fwd_enc = F.mse_loss(phi_pred_enc, phi_s_next_idm.detach(), reduction='none').mean(dim=1)
+                    if IGNORE_DONES:
+                        fwd_loss_enc = per_sample_fwd_enc.mean()
+                    else:
+                        fwd_loss_enc = (per_sample_fwd_enc * mb_not_terminal).sum() / (mb_not_terminal.sum().clamp_min(1))
+
+                    # Pathak's joint optimization: (1-β)L_I + βL_F
+                    beta = 0.25
+                    joint_loss_val = (1 - beta) * idm_loss_val + beta * fwd_loss_enc
+
+                    # Backward for encoder + IDM (joint optimization)
+                    feat_idm_optimizer.zero_grad(set_to_none=True)
+                    joint_loss_val.backward()
                     feat_idm_optimizer.step()
 
                     idm_loss = idm_loss_val.item()
+
+                # Backward for forward model only (separate computation)
+                fwd_optimizer.zero_grad(set_to_none=True)
+                fwd_loss_val.backward()
+                fwd_optimizer.step()
+
+                fwd_loss = fwd_loss_val.item()
 
                 # Accumulate losses
                 total_pi_loss += pi_loss
@@ -805,7 +892,9 @@ if __name__ == '__main__':
                 total_fwd_loss += fwd_loss
                 total_idm_loss += idm_loss
                 n_updates += 1
-
+            
+            s = time.time()
+            print(f"EPOCH {epoch} took {(s-e):0.2f}")
         # Average losses
         pi_loss = total_pi_loss / n_updates
         v_loss = total_v_loss / n_updates
@@ -818,34 +907,21 @@ if __name__ == '__main__':
         _, mean_i_running, std_i_running = rwd_i_rms.get()
         _, mean_e_running, std_e_running = rwd_e_rms.get()
 
-        # CRITICAL: Also compute CURRENT BATCH statistics (not running average)
-        # This shows what's happening RIGHT NOW in this iteration
-        all_rwds_i = []
-        all_rwds_e = []
-        for ep in episodes:
-            _, _, _, _, _, _, rwds_e, rwds_i, _, _, _ = ep
-            all_rwds_i.extend(rwds_i)
-            all_rwds_e.extend(rwds_e)
-
         # Intrinsic reward statistics
-        batch_mean_i = np.mean(all_rwds_i) if all_rwds_i else 0.0
-        batch_std_i = np.std(all_rwds_i) if all_rwds_i else 0.0
-        batch_max_i = np.max(all_rwds_i) if all_rwds_i else 0.0
-        batch_min_i = np.min(all_rwds_i) if all_rwds_i else 0.0
+        batch_mean_i = np.mean(all_rwds_i_raw) if all_rwds_i_raw else 0.0
+        batch_std_i = np.std(all_rwds_i_raw) if all_rwds_i_raw else 0.0
+        batch_max_i = np.max(all_rwds_i_raw) if all_rwds_i_raw else 0.0
+        batch_min_i = np.min(all_rwds_i_raw) if all_rwds_i_raw else 0.0
 
         # Extrinsic reward statistics (always log even if INTRINSIC_ONLY)
-        batch_mean_e = np.mean(all_rwds_e) if all_rwds_e else 0.0
-        batch_std_e = np.std(all_rwds_e) if all_rwds_e else 0.0
-        batch_max_e = np.max(all_rwds_e) if all_rwds_e else 0.0
-        batch_sum_e = np.sum(all_rwds_e) if all_rwds_e else 0.0  # Total game rewards this iteration
+        batch_mean_e = np.mean(all_rwds_e_raw) if all_rwds_e_raw else 0.0
+        batch_std_e = np.std(all_rwds_e_raw) if all_rwds_e_raw else 0.0
+        batch_max_e = np.max(all_rwds_e_raw) if all_rwds_e_raw else 0.0
+        batch_sum_e = np.sum(all_rwds_e_raw) if all_rwds_e_raw else 0.0  # Total game rewards this iteration
 
         # Calculate total reward (weighted sum, accounting for INTRINSIC_ONLY)
-        if INTRINSIC_ONLY:
-            total_reward = INTRINSIC_COEF * mean_i_running
-            batch_total = INTRINSIC_COEF * batch_mean_i
-        else:
-            total_reward = EXTRINSIC_COEF * mean_e_running + INTRINSIC_COEF * mean_i_running
-            batch_total = EXTRINSIC_COEF * batch_mean_e + INTRINSIC_COEF * batch_mean_i
+        total_reward = EXTRINSIC_COEF * mean_e_running + INTRINSIC_COEF * mean_i_running
+        batch_total = EXTRINSIC_COEF * batch_mean_e + INTRINSIC_COEF * batch_mean_i
 
         # Log to wandb
         log_dict = {
@@ -873,9 +949,9 @@ if __name__ == '__main__':
             "loss/forward_dynamics": fwd_loss,
             "time/iteration_time": iter_time,
             "time/fps": frame_counter.get() / iter_time,
-            "data/episodes_collected": len(episodes),
+            "data/episodes_collected": total_episodes,
             "data/frames_collected": frame_counter.get(),
-        }
+            }
 
         # Add IDM loss if using inverse dynamics
         if USE_INVERSE_DYNAMICS:
@@ -894,7 +970,7 @@ if __name__ == '__main__':
             print(f"  ^ Note: Training with INTRINSIC_ONLY (extrinsic not used for learning)")
 
         # Save checkpoint
-        if (iter_idx + 1) % 10 == 0:
+        if (iter_idx + 1) % 25 == 0:
             checkpoint = {
                 'iteration': iter_idx + 1,
                 'agent_state_dict': agent.state_dict(),

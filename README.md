@@ -1,8 +1,6 @@
-# Doom Curiosity Playground (notes-in-progress)
+# Doom Curiosity Playground [WIP] 
 
-> ⚠️ This README is intentionally incomplete. I will come back and fill in the conceptual and algorithmic explanations after I’ve internalised both papers.
-
-## 1. Install & Run (tedious bits handled here)
+## 1. Install & Run 
 
 ### 1.1 Clone & assets
 ```bash
@@ -10,7 +8,7 @@ git clone https://github.com/pythonlearner1025/BoredDoomGuy.git
 cd BoredDoomGuy
 ```
 
-Download/locate `Doom1.WAD` (Ultimate Doom). Place it at the repo root next to `idm.py`.
+Download/locate `Doom1.WAD` (Ultimate Doom). Place it at the repo root 
 
 - Steam/GOG purchasers: copy the original WAD and rename to `Doom1.WAD`
 - Shareware fallback:
@@ -32,13 +30,13 @@ PyTorch + ViZDoom wheel selections are pinned inside `requirements.txt`. If whee
 ### 1.3 Baseline run (ICM)
 ```bash
 source env/bin/activate
-python idm.py
+python icm.py
 ```
 
 ### 1.4 LPM run
 ```bash
 source env/bin/activate
-python idm_lpm.py  # accepts env overrides like LPM_ITERS, LPM_DRY_RUN
+python icm_lpm.py  # accepts env overrides like LPM_ITERS, LPM_DRY_RUN
 ```
 
 WandB logging is enabled by default; set `WANDB_MODE=disabled` if running in restricted environments.
@@ -49,47 +47,33 @@ WandB logging is enabled by default; set `WANDB_MODE=disabled` if running in res
 - **API**: ViZDoom player mode, 60×80 grayscale stacks (FRAME_SKIP=4, FRAME_STACK=4)
 - **Action space**: macro-actions defined in `MACRO_ACTIONS` inside each script
 
-TODO: Describe relevant extrinsic rewards, termination conditions, and known quirks (e.g., teleports, enemies, doors).
+In both icm.py and icm_lpm.py, the environment runs in infinite horizon mode - the episode ending (death) does not terminate the observe/act loop in run_episode. Only reaching the timeout or number of global collected frames exceeding global max_frames triggers an exit from the observe/act loop.
+
+Following idea from Burda et al, death -> respawn is just another state transition. This infinite horizon formulation is aligned with how human players play, and prevents reward hacking behavior like suicide when episode gets too boring. This is possible because the spawn area would be so well explored that the agent won't find it interesting - incentivizing it to explore the beyond. 
 
 ## 3. Papers & origin
 
 | Implementation | Reference | Link |
 | -------------- | --------- | ---- |
-| `idm.py`       | Pathak et al., Intrinsic Curiosity Module | https://arxiv.org/pdf/1705.05363 |
-| `idm_lpm.py`   | *Beyond Noisy TVs: Noise-Robust Exploration via Learning Progress Monitoring* | https://arxiv.org/pdf/2509.25438v1 |
+| `icm.py`       |  Large Scale Curiosity Driven Learning | https://arxiv.org/pdf/1808.04355 |
+| `icm_lpm.py`   | *Beyond Noisy TVs: Noise-Robust Exploration via Learning Progress Monitoring* | https://arxiv.org/pdf/2509.25438v1 |
 
-I will summarise the contributions from each once I finish re-reading them carefully.
+## 4. `icm.py` – Intrinsic Curiosity Module (outline for me to fill)
 
-## 4. `idm.py` – Intrinsic Curiosity Module (outline for me to fill)
+It's Pathak's original Intrinsic Curiosity Module (ICM) formulation but with PPO over normalized advantages via Generalized Advantage Estimation.
 
-### 4.1 Core idea (placeholder)
-- TODO: explain inverse dynamics vs forward model loss trade-off.
-- TODO: discuss intrinsic reward scaling and running stats.
+The core idea is to define curiosity as error prediction the next state. A forward dynamics model is trained to predict an encoded representation of the next state phi(s_{t+1}) given the current state phi(s_{t}) and the action a_{t}. The encoder phi is aligned to represent features of states that are only influeancable by the agent's actions (since there are too many features in a complex environment). This is done by defining an inverse dynamics model IDM that takes as input phi(s_{t}, s_{t+1}) and outputs prediction of the action at time t, a_{hat}_{t}. The loss mse(a_{hat}_{t}, a_{t}) then backprops to the encoder model phi. 
 
-### 4.2 Implementation pointers
-```python
-# Encoder & policy/value heads
-agent = Agent(n_actions).to(device)               # idm.py:120-ish
+### 4.1 Implementation pointers
+TODO CODEX: rewrite the above paragraph in section 4 using real code in icm.py. 
 
-# Curiosity models
-phi_enc = TrainableEncoder(...); fwd_model = ForwardDynamicsModel(...)
-idm_model = InverseDynamicsModel(...)
-```
+## 5. `icm_lpm.py` – Learning Progress Monitoring 
 
-### 4.3 What I still need to reason about
-- [ ] How PPO minibatching interacts with feature learning.
-- [ ] Effect of `IGNORE_DONES=True` in Doom (think about lava pits / death resets).
-- [ ] Calibration of intrinsic vs extrinsic weighting in this specific level.
-
-## 5. `idm_lpm.py` – Learning Progress Monitoring (outline for me to fill)
-
-### 5.1 Core idea (placeholder)
-- TODO: articulate the dual-network setup and why expected past error matters.
-- TODO: capture how log-MSE stabilises the intrinsic signal.
+Learning progress monitoring differes from Pathak's ICM by defining rwd_i = (expected_error_t - error_t), where error_t is the mse(phi_obs_next_t, dynamics_model.forward(phi_obs_t, act_t)). expected_error_t is predicted by an error prediction model where expected_error_t = error_model.forward(phi_obs_t, act_t). The error model is trained over a buffer of pairs of (phi_obs_t, act_t, error_t) from outer loop iteration T, and evaluated in rollout at iteration T+1. To understand what the error difference means, consdier a state obs_t which yields high entropy from both models due to pure noise. In this case expected_error_t ~= error_t, because both the error_model or dynamics_model can't compress noise. Thus the rwd_i is low and the model doesn't get stuck in the Noisy TV problem. Contrarily if obs_t yields high entropy but this is due to epistemic uncertainty, reward will be positive as long as forward dynamics model leads in learning the epistemic state transition knowledge, until both error model and forward dynamics model reach a similar understanding and reward is again ~= zero.     
 
 ### 5.2 Code landmarks
 ```python
-dynamics_model = LPMDynamicsModel(n_actions).to(device)  # idm_lpm.py:781-784
+dynamics_model = LPMDynamicsModel(n_actions).to(device)  # icm_lpm.py:781-784
 error_model = LPMErrorModel(n_actions).to(device)
 
 # Intrinsic reward inside rollout:
@@ -109,7 +93,7 @@ intrinsic_reward = (expected_error - epsilon) if error_ready else 0.0
 ## 6. Shared config knobs (for quick lookup)
 
 - `FRAME_SKIP`, `FRAME_STACK`, `MAX_ROLLOUT_FRAMES`, `MAX_FRAMES_PER_EPISODE`
-- Threading: defaults to `cpu_count() - 2`, override with `LPM_THREADS` (LPM script) or edit constants in `idm.py`
+- Threading: defaults to `cpu_count() - 2`, override with `LPM_THREADS` (LPM script) or edit constants in `icm.py`
 - Checkpoint cadence: every 25 iterations (ICM) and mirrored in LPM script
 - Debug frame dumps land in `debug/` (ignored by git)
 
@@ -118,4 +102,4 @@ intrinsic_reward = (expected_error - epsilon) if error_ready else 0.0
 - [ ] Flesh out conceptual sections above in my own words.
 - [ ] Add diagrams / reward curves once experiments stabilise.
 - [ ] Document best-known hyperparameter tweaks for Doom E1M1.
-- [ ] Summarise differences between `idm.py` and `idm_lpm.py` once confident.
+- [ ] Summarise differences between `icm.py` and `icm_lpm.py` once confident.
