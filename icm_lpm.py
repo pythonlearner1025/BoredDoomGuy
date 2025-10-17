@@ -43,7 +43,7 @@ def get_env_int(name, default):
 # ============================================================================
 ITERS = get_env_int("LPM_ITERS", 1000)
 EPOCHS = 4  # INCREASED: More training iterations to learn bullet/wall dynamics thoroughly
-MAX_ROLLOUT_FRAMES = get_env_int("LPM_MAX_ROLLOUT_FRAMES", int(3e4))  # Reduced to avoid OOM
+MAX_ROLLOUT_FRAMES = get_env_int("LPM_MAX_ROLLOUT_FRAMES", int(2e4))  # Reduced to avoid OOM
 MAX_FRAMES_PER_EPISODE = get_env_int("LPM_MAX_FRAMES_PER_EPISODE", int(37.5*60*1))  # Per-thread 1 minute episode limit
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
@@ -59,13 +59,13 @@ INTRINSIC_ONLY = True  # If True, train with only intrinsic reward (no extrinsic
 INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.5
 EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.5  # Set to 0.0 for pure curiosity (Burda et al.)
 IGNORE_DONES = True  # "Death is not the end" - infinite horizon bootstrapping
-FRAME_SKIP = 4
+FRAME_SKIP = 2
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
 ENCODER_FEATS = 512
 
 # LPM specific replay/buffer parameters
-ERROR_BUFFER_SIZE = MAX_ROLLOUT_FRAMES * 1
-DYNAMICS_REPLAY_SIZE = MAX_ROLLOUT_FRAMES * 1
+ERROR_BUFFER_SIZE = MAX_ROLLOUT_FRAMES * 3
+DYNAMICS_REPLAY_SIZE = MAX_ROLLOUT_FRAMES * 3
 
 ERROR_WARMUP = ERROR_BUFFER_SIZE // 2
 
@@ -246,7 +246,6 @@ class LPMDynamicsModel(nn.Module):
         z = F.relu(self.fc2(z))
         return self.fc_out(z)
 
-
 class LPMErrorModel(nn.Module):
     """Predicts expected previous log-MSE error for (obs, action)."""
     def __init__(self, n_actions, feat_dim=512, hidden=512):
@@ -276,7 +275,7 @@ class RandomEncoder(nn.Module):
         super().__init__()
         # Use local RNG fork to avoid clobbering global seed
         with torch.random.fork_rng():
-            torch.manual_seed(69)
+            torch.manual_seed(42)
             self.net = get_cnn(in_ch, out_dim)
 
         # Add batch norm for feature stability (Burda et al. Sec 2.2)
@@ -296,61 +295,61 @@ class RandomEncoder(nn.Module):
 class DynamicsReplayBuffer:
     """Fixed-size replay buffer storing transitions for dynamics training."""
     def __init__(self, capacity):
-        from collections import deque
         self.capacity = capacity
-        self.obs = deque(maxlen=capacity)
-        self.next_obs = deque(maxlen=capacity)
-        self.actions = deque(maxlen=capacity)
-
-    def __len__(self):
-        return len(self.obs)
-
+        self.obs = []
+        self.next_obs = []
+        self.actions = []
+    
+    def __len__(self): return len(self.obs)
+    
     def extend(self, obs_batch, action_batch, next_obs_batch):
         for o, a, n in zip(obs_batch, action_batch, next_obs_batch):
+            if len(self.obs) >= self.capacity:
+                # Remove from left (guaranteed uniform random due to shuffle in sample)
+                self.obs.pop(0)
+                self.actions.pop(0)
+                self.next_obs.pop(0)
             self.obs.append(o.astype(np.uint8))
             self.actions.append(int(a))
             self.next_obs.append(n.astype(np.uint8))
-
+    
     def sample(self, batch_size):
-        idxs = np.random.choice(len(self.obs), size=batch_size, replace=False)
-        obs_batch = torch.tensor(np.stack([self.obs[i] for i in idxs]), dtype=torch.float32)
-        act_batch = torch.tensor([self.actions[i] for i in idxs], dtype=torch.long)
-        next_obs_batch = torch.tensor(np.stack([self.next_obs[i] for i in idxs]), dtype=torch.float32)
+        # Shuffle all lists in-place to guarantee uniform random eviction
+        indices = list(range(len(self.obs)))
+        random.shuffle(indices)
+        self.obs = [self.obs[i] for i in indices]
+        self.actions = [self.actions[i] for i in indices]
+        self.next_obs = [self.next_obs[i] for i in indices]
+        
+        # Select first batch_size elements
+        obs_batch = torch.tensor(np.stack(self.obs[:batch_size]), dtype=torch.float32)
+        act_batch = torch.tensor(self.actions[:batch_size], dtype=torch.long)
+        next_obs_batch = torch.tensor(np.stack(self.next_obs[:batch_size]), dtype=torch.float32)
         return obs_batch, act_batch, next_obs_batch
-
 
 class ErrorReplayBuffer:
     """Queue storing (obs, action, epsilon) tuples for error model training."""
     def __init__(self, capacity):
-        from collections import deque
         self.capacity = capacity
-        self.ready = deque(maxlen=capacity)
-        self.pending = deque()
-
-    def __len__(self):
-        return len(self.ready)
-
+        self.storage = []
+    
+    def __len__(self): return len(self.storage)
+    
     def extend(self, obs_batch, action_batch, epsilon_batch):
         for o, a, e in zip(obs_batch, action_batch, epsilon_batch):
             sample = (o.astype(np.uint8), int(a), float(e))
-            self.pending.append(sample)
-            if len(self.pending) > self.capacity:
-                self.pending.popleft()
-
-    def commit_pending(self):
-        while self.pending:
-            self.ready.append(self.pending.popleft())
-
+            self.storage.append(sample)
+    
     def sample(self, batch_size):
-        if len(self.ready) < batch_size:
-            raise ValueError("Not enough committed samples for error buffer")
-        storage = list(self.ready)
-        idxs = np.random.choice(len(storage), size=batch_size, replace=False)
-        obs_batch = torch.tensor(np.stack([storage[i][0] for i in idxs]), dtype=torch.float32)
-        act_batch = torch.tensor([storage[i][1] for i in idxs], dtype=torch.long)
-        eps_batch = torch.tensor([storage[i][2] for i in idxs], dtype=torch.float32)
+        
+        # Shuffle list in-place to guarantee uniform random eviction
+        random.shuffle(self.storage)
+        
+        # Select first batch_size elements
+        obs_batch = torch.tensor(np.stack([self.storage[i][0] for i in range(batch_size)]), dtype=torch.float32)
+        act_batch = torch.tensor([self.storage[i][1] for i in range(batch_size)], dtype=torch.long)
+        eps_batch = torch.tensor([self.storage[i][2] for i in range(batch_size)], dtype=torch.float32)
         return obs_batch, act_batch, eps_batch
-
 # ============================================================================
 # GAE Computation
 # ============================================================================
@@ -507,7 +506,8 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         with torch.no_grad():
             phi_t = encoder_model(obs_t)
             pred_next = dynamics_model(phi_t, act_onehot)
-            expected_error = error_model(phi_t, act_onehot).item()
+            expected_error_log = error_model(phi_t, act_onehot).item()
+            expected_error = math.exp(expected_error_log)
 
         # Take action using macro action
         action_buttons = MACRO_ACTIONS[act_idx_item]
@@ -531,7 +531,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
 
                 mse = F.mse_loss(pred_next, phi_next_t, reduction='none')
             mse_flat = mse.view(mse.shape[0], -1).mean(dim=1)
-            epsilon = torch.log(mse_flat + EPSILON_CLAMP).item()
+            epsilon = mse_flat.item()
         else:
             obs_next_stacked = np.zeros_like(obs_stacked)  # Placeholder
             raw_frame_next_hwc = np.zeros_like(raw_frame_hwc)
@@ -947,7 +947,8 @@ if __name__ == '__main__':
                     phi_obs = encoder_model(obs_b)
 
                 eps_pred = error_model(phi_obs, act_onehot)
-                err_loss = F.mse_loss(eps_pred, eps_b)
+                log_targets = torch.log(eps_b + EPSILON_CLAMP)
+                err_loss = F.mse_loss(eps_pred, log_targets)
 
                 error_optimizer.zero_grad(set_to_none=True)
                 err_loss.backward()
@@ -957,7 +958,7 @@ if __name__ == '__main__':
                 error_loss_total += err_loss.item()
                 error_updates += 1
 
-                eps_pred_total += eps_pred.mean().item()
+                eps_pred_total += torch.exp(eps_pred).mean().item()
                 eps_actual_total += eps_b.mean().item()
 
             epoch_end = time.time()
@@ -1038,10 +1039,7 @@ if __name__ == '__main__':
 
         wandb.log(log_dict)
 
-        # make newly collected errors available for the next iteration
-        error_buffer.commit_pending()
-
-        print(f"Time: {iter_time:.1f}s | FPS: {frame_counter.get()/iter_time:.0f}")
+        print(f"Timer {iter_time:.1f}s | FPS: {frame_counter.get()/iter_time:.0f}")
         print(f"Policy Loss: {pi_loss:.4f}, Value Loss: {v_loss:.4f}, Entropy: {-ent_loss:.4f}")
         print(f"Dynamics Loss: {dynamics_loss:.6f}, Error Model Loss: {error_loss_mean:.6f}")
         print(f"Intrinsic (batch): μ={batch_mean_i:.6f}, σ={batch_std_i:.6f}, max={batch_max_i:.6f}")

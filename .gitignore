@@ -6,6 +6,8 @@ env3.12/
 Arnold/
 wandb/
 agent_playback/
+
+LPM_exploration/
 ViZDoom/
 screens/
 _vizdoom/

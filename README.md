@@ -8,7 +8,7 @@ git clone https://github.com/pythonlearner1025/BoredDoomGuy.git
 cd BoredDoomGuy
 ```
 
-Download/locate `Doom1.WAD` (Ultimate Doom). Place it at the repo root 
+Download/locate `Doom1.WAD` (Ultimate Doom). Place it at the repo root.
 
 - Steam/GOG purchasers: copy the original WAD and rename to `Doom1.WAD`
 - Shareware fallback:
@@ -39,7 +39,7 @@ source env/bin/activate
 python icm_lpm.py  # accepts env overrides like LPM_ITERS, LPM_DRY_RUN
 ```
 
-WandB logging is enabled by default; set `WANDB_MODE=disabled` if running in restricted environments.
+WandB logging is enabled by default. Set `WANDB_MODE=disabled` when running in restricted environments.
 
 ## 2. Environment snapshot
 
@@ -47,9 +47,9 @@ WandB logging is enabled by default; set `WANDB_MODE=disabled` if running in res
 - **API**: ViZDoom player mode, 60×80 grayscale stacks (FRAME_SKIP=4, FRAME_STACK=4)
 - **Action space**: macro-actions defined in `MACRO_ACTIONS` inside each script
 
-In both icm.py and icm_lpm.py, the environment runs in infinite horizon mode - the episode ending (death) does not terminate the observe/act loop in run_episode. Only reaching the timeout or number of global collected frames exceeding global max_frames triggers an exit from the observe/act loop.
+In both `icm.py` and `icm_lpm.py`, the environment runs in infinite-horizon mode. Death does not terminate the observe/act loop in `run_episode`, and only hitting the timeout or `max_frames` stops the rollout.
 
-Following idea from Burda et al, death -> respawn is just another state transition. This infinite horizon formulation is aligned with how human players play, and prevents reward hacking behavior like suicide when episode gets too boring. This is possible because the spawn area would be so well explored that the agent won't find it interesting - incentivizing it to explore the beyond. 
+Following Burda et al., the death-to-respawn transition is treated as just another state change. This mirrors how people play Doom and discourages reward hacking via intentional suicide, because the spawn room becomes boring once the agent has fully explored it.
 
 ## 3. Papers & origin
 
@@ -58,48 +58,64 @@ Following idea from Burda et al, death -> respawn is just another state transiti
 | `icm.py`       |  Large Scale Curiosity Driven Learning | https://arxiv.org/pdf/1808.04355 |
 | `icm_lpm.py`   | *Beyond Noisy TVs: Noise-Robust Exploration via Learning Progress Monitoring* | https://arxiv.org/pdf/2509.25438v1 |
 
-## 4. `icm.py` – Intrinsic Curiosity Module (outline for me to fill)
+## 4. `icm.py` – Intrinsic Curiosity Module
 
-It's Pathak's original Intrinsic Curiosity Module (ICM) formulation but with PPO over normalized advantages via Generalized Advantage Estimation.
+Pathak's Intrinsic Curiosity Module trains a forward dynamics predictor alongside PPO with GAE-normalised advantages. Curiosity is the prediction error between encoded next-state features and the forward model's output, so we freeze the policy rollout to collect frame stacks and actions.
 
-The core idea is to define curiosity as error prediction the next state. A forward dynamics model is trained to predict an encoded representation of the next state phi(s_{t+1}) given the current state phi(s_{t}) and the action a_{t}. The encoder phi is aligned to represent features of states that are only influeancable by the agent's actions (since there are too many features in a complex environment). This is done by defining an inverse dynamics model IDM that takes as input phi(s_{t}, s_{t+1}) and outputs prediction of the action at time t, a_{hat}_{t}. The loss mse(a_{hat}_{t}, a_{t}) then backprops to the encoder model phi. 
+During each PPO minibatch we encode the stacked frames, predict the next embedding, and measure the curiosity reward as the mean-squared error. The encoder then feeds an inverse dynamics model that learns to recover the action, keeping features focused on agent-controllable factors.
 
-### 4.1 Implementation pointers
-TODO CODEX: rewrite the above paragraph in section 4 using real code in icm.py. 
+```python
+phi_s = phi_enc(mb_obs_stack)
+phi_s_next = phi_enc(mb_obs_next_stack)
+phi_pred = fwd_model(phi_s.detach(), act_onehot)
+
+per_sample_fwd = F.mse_loss(phi_pred, phi_s_next.detach(), reduction='none').mean(dim=1)
+fwd_loss_val = per_sample_fwd.mean()
+
+phi_s_idm = phi_enc(mb_obs_stack)
+phi_s_next_idm = phi_enc(mb_obs_next_stack)
+
+action_logits = idm_model(phi_s_idm, phi_s_next_idm)
+phi_pred_enc = fwd_model(phi_s_idm, act_onehot)
+
+idm_loss_val = F.cross_entropy(action_logits, mb_acts, reduction='none').mean()
+fwd_loss_enc = F.mse_loss(phi_pred_enc, phi_s_next_idm.detach(), reduction='none').mean(dim=1).mean()
+joint_loss_val = (1 - beta) * idm_loss_val + beta * fwd_loss_enc
+```
+
+We optimise the joint loss to update the encoder and IDM while training the forward model separately so gradients stay stable. This mirrors the original ICM recipe but plugs directly into the Doom macro-action loop with infinite horizon.
 
 ## 5. `icm_lpm.py` – Learning Progress Monitoring 
 
-Learning progress monitoring differes from Pathak's ICM by defining rwd_i = (expected_error_t - error_t), where error_t is the mse(phi_obs_next_t, dynamics_model.forward(phi_obs_t, act_t)). expected_error_t is predicted by an error prediction model where expected_error_t = error_model.forward(phi_obs_t, act_t). The error model is trained over a buffer of pairs of (phi_obs_t, act_t, error_t) from outer loop iteration T, and evaluated in rollout at iteration T+1. To understand what the error difference means, consdier a state obs_t which yields high entropy from both models due to pure noise. In this case expected_error_t ~= error_t, because both the error_model or dynamics_model can't compress noise. Thus the rwd_i is low and the model doesn't get stuck in the Noisy TV problem. Contrarily if obs_t yields high entropy but this is due to epistemic uncertainty, reward will be positive as long as forward dynamics model leads in learning the epistemic state transition knowledge, until both error model and forward dynamics model reach a similar understanding and reward is again ~= zero.     
+Learning Progress Monitoring (LPM) reframes curiosity as the gap between predicted dynamics error and realised error. We encode the frame stack, roll it through the dynamics model, and subtract the observed MSE so the intrinsic reward only stays high where learning progress is unfolding.
 
-### 5.2 Code landmarks
+When the agent encounters pure noise, both models plateau at the same reconstruction error, and the reward approaches zero. Epistemically uncertain but learnable transitions keep producing positive gaps until the dynamics predictor catches up, discouraging the classic Noisy TV trap.
+
 ```python
-dynamics_model = LPMDynamicsModel(n_actions).to(device)  # icm_lpm.py:781-784
-error_model = LPMErrorModel(n_actions).to(device)
+with torch.no_grad():
+    phi_t = encoder_model(obs_t)
+    pred_next = dynamics_model(phi_t, act_onehot)
+    expected_error = math.exp(error_model(phi_t, act_onehot).item())
 
-# Intrinsic reward inside rollout:
+phi_next_t = encoder_model(obs_next_t)
+epsilon = F.mse_loss(pred_next, phi_next_t, reduction='none').view(1, -1).mean().item()
 intrinsic_reward = (expected_error - epsilon) if error_ready else 0.0
+
+pred_next = dynamics_model(phi_obs, act_onehot)
+dyn_loss = F.mse_loss(pred_next, phi_next)
+eps_pred = error_model(phi_obs, act_onehot)
+
+err_loss = F.mse_loss(eps_pred, torch.log(eps_b + EPSILON_CLAMP))
 ```
 
-### 5.3 Handling the noisy TV claim
-- TODO: Summarise the noisy-TV argument from the paper (expected error vs single-sample).
-- TODO: Contrast with raw prediction error approaches.
-- TODO: Note any implementation gotchas (buffers, warm-up, log-space).
+The outer loop serially performs PPO updates, then replay-driven training for dynamics and error models. This keeps the expected-error predictor calibrated against the replay buffers gathered in the previous iteration.
 
-### 5.4 My empirical notes (to be completed after experiments)
+### My empirical notes (to be completed after experiments)
 
 - **Does LPM actually suppress noisy-TV artefacts in Doom E1M1?**  
   > _Leave this section blank until I run controlled tests; note down observations, plots, and failure cases here._
 
-## 6. Shared config knobs (for quick lookup)
-
-- `FRAME_SKIP`, `FRAME_STACK`, `MAX_ROLLOUT_FRAMES`, `MAX_FRAMES_PER_EPISODE`
-- Threading: defaults to `cpu_count() - 2`, override with `LPM_THREADS` (LPM script) or edit constants in `icm.py`
-- Checkpoint cadence: every 25 iterations (ICM) and mirrored in LPM script
-- Debug frame dumps land in `debug/` (ignored by git)
-
 ## 7. TODOs for future revision
 
-- [ ] Flesh out conceptual sections above in my own words.
 - [ ] Add diagrams / reward curves once experiments stabilise.
 - [ ] Document best-known hyperparameter tweaks for Doom E1M1.
-- [ ] Summarise differences between `icm.py` and `icm_lpm.py` once confident.
