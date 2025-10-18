@@ -23,14 +23,13 @@ from model import (
     DynamicsReplayBuffer, 
     ErrorReplayBuffer, 
     RunningStats,
-    RewardRMS
 )
 
 ITERS = 1000
 EPOCHS = 3  
 FRAME_SKIP = 4
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
-MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(5e4)  # Reduced to avoid OOM
+MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(4e4)  # Reduced to avoid OOM
 MAX_FRAMES_PER_EPISODE = int(37.5*60*3)  # Per-thread 1 minute episode limit
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
@@ -57,8 +56,8 @@ EPISODIC_WEIGHT = 0.0
 SKIP_FRAMES_NOVELTY = 15 if EPISODIC_WEIGHT > 0 else 1e6 # every 0.5 seconds 
 
 # LPM specific replay/buffer parameters
-ERROR_BUFFER_SIZE = MAX_ROLLOUT_FRAMES * 3
-DYNAMICS_REPLAY_SIZE = MAX_ROLLOUT_FRAMES * 3
+ERROR_BUFFER_SIZE = (MAX_ROLLOUT_FRAMES * 5) // FRAME_SKIP
+DYNAMICS_REPLAY_SIZE = (MAX_ROLLOUT_FRAMES * 5) // FRAME_SKIP
 ERROR_WARMUP = ERROR_BUFFER_SIZE // 2
 
 DYNAMICS_LEARNING_RATE = 1e-4
@@ -159,8 +158,9 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     game.set_doom_game_path(wad_path)
     game.set_doom_map("E1M1")
     game.set_render_hud(False)
-    game.set_hit_reward(1.0)
-    game.set_kill_reward(2.0)
+    #game.set_hit_reward(1.0) #hitting barrels also give reward, so disable this
+    game.set_death_reward(-1.0)
+    game.set_kill_reward(1.0)
     game.set_armor_reward(0.5)
     game.set_health_reward(0.5)
     game.set_map_exit_reward(10.0)
@@ -258,7 +258,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
             continue
 
         learning_progress = max(expected_error_log - epsilon, 0.0) if error_ready else 0.0
-        intrinsic_reward = (
+        rwd_i = (
             LP_WEIGHT * learning_progress +
             EPISODIC_WEIGHT * episodic_novelty
         )
@@ -273,7 +273,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         logps.append(logp.item())
         vals.append(val.item())
         rwds_e.append(rwd_e)
-        rwds_i.append(intrinsic_reward)
+        rwds_i.append(rwd_i)
         novelties.append(episodic_novelty)
         learning_progresses.append(learning_progress)
         dones.append(done_flag)
@@ -282,7 +282,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         frames_collected += FRAME_SKIP
 
         # Update running rewards for stats
-        run_rwd_i = run_rwd_i * GAMMA_INT + intrinsic_reward
+        run_rwd_i = run_rwd_i * GAMMA_INT + rwd_i
         run_rwd_e = run_rwd_e * GAMMA_EXT + rwd_e
 
     intrinsic_stats, extrinsic_stats = stats
@@ -420,10 +420,10 @@ if __name__ == '__main__':
 
     dynamics_buffer = DynamicsReplayBuffer(DYNAMICS_REPLAY_SIZE)
     error_buffer = ErrorReplayBuffer(ERROR_BUFFER_SIZE)
-    stats = (RunningStats(), RunningStats())
     # Running RMS normalizers for rewards (as in Burda et al.)
-    rwd_i_rms = RewardRMS()
-    rwd_e_rms = RewardRMS()
+    rwd_i_rms = RunningStats()
+    rwd_e_rms = RunningStats()
+    stats = (rwd_i_rms, rwd_e_rms)
 
     for iter_idx in range(ITERS):
         print(f"\n=== Iteration {iter_idx+1}/{ITERS} ===")
@@ -519,14 +519,14 @@ if __name__ == '__main__':
         error_model.train()
         print(f"Collected {total_episodes} episodes, {frame_counter.get()} frames")
 
-        # Update running reward normalizers and scale by running std
-        if all_rwds_i_raw:
-            rwd_i_rms.update(all_rwds_i_raw)
-        if all_rwds_e_raw:
-            rwd_e_rms.update(all_rwds_e_raw)
+        _, _, rwd_i_std = rwd_i_rms.get()
+        _, _, rwd_e_std = rwd_e_rms.get()
 
-        intrinsic_scale = max(float(rwd_i_rms.std()), 1e-3) if all_rwds_i_raw else 1.0
-        extrinsic_scale = max(float(rwd_e_rms.std()), 1e-3) if all_rwds_e_raw else 1.0
+        intrinsic_scale = max(float(rwd_i_std), 1e-3) if all_rwds_i_raw else 1.0
+        extrinsic_scale = max(float(rwd_e_std), 1e-3) if all_rwds_e_raw else 1.0
+
+        rwds_e_norm_scaled = []
+        rwds_i_norm_scaled = []
 
         for episode in episodes_data:
             rwds_i_norm = episode["rwds_i"] / intrinsic_scale
@@ -541,6 +541,9 @@ if __name__ == '__main__':
                 GAMMA_EXT,  
                 GAE_LAMBDA
             )
+
+            rwds_e_norm_scaled.append(rwds_e_norm)
+            rwds_i_norm_scaled.append(rwds_i_norm)
 
             all_obs.append(episode["obs"])
             all_obs_next.append(episode["obs_next"])
@@ -656,8 +659,8 @@ if __name__ == '__main__':
         error_actual_mean = eps_actual_total / max(error_updates, 1) if error_updates else 0.0
 
         iter_time = time.time() - iter_start
-        _, mean_i_running, std_i_running = stats[0].get()
-        _, mean_e_running, std_e_running = stats[1].get()
+        _, mean_i_running, std_i_running = rwd_i_rms.get()
+        _, mean_e_running, std_e_running = rwd_e_rms.get()
 
         batch_mean_i = np.mean(all_rwds_i_raw) if all_rwds_i_raw else 0.0
         batch_std_i = np.std(all_rwds_i_raw) if all_rwds_i_raw else 0.0
@@ -687,22 +690,29 @@ if __name__ == '__main__':
 
         log_dict = {
             "update_step": iter_idx + 1,
-            "reward/intrinsic_running": mean_i_running,
-            "reward/extrinsic_running": mean_e_running,
             "lpm/error_pred_mean": error_pred_mean,
             "lpm/error_actual": error_actual_mean,
             "reward/learning_progress_mean": learning_progress_mean,
+            "reward/intrinsic_batch_mean": batch_mean_i,
+            "reward/extrinsic_batch_mean": batch_mean_e,
+            "reward/extrinsic_batch_norm_mean": float(np.mean(rwds_e_norm_scaled)),
+            "reward/intrinsic_batch_norm_mean": float(np.mean(rwds_i_norm_scaled)),
+            "loss/policy": pi_loss,
+            "loss/value": v_loss,
+            "loss/entropy": -ent_loss,
+            "loss/dynamics": dynamics_loss,
+            "loss/error_model": error_loss_mean,
+            "reward/intrinsic_running": mean_i_running,
+            "reward/extrinsic_running": mean_e_running,
             "reward/learning_progress_std": learning_progress_std,
             "reward/learning_progress_max": learning_progress_max,
             "reward/intrinsic_std_running": std_i_running if not math.isnan(std_i_running) else 0,
             "reward/extrinsic_std_running": std_e_running if not math.isnan(std_e_running) else 0,
-            "reward/intrinsic_std_rms": rwd_i_rms.std(),
-            "reward/extrinsic_std_rms": rwd_e_rms.std(),
-            "reward/intrinsic_batch_mean": batch_mean_i,
+            "reward/intrinsic_std_rms": rwd_i_std,
+            "reward/extrinsic_std_rms": rwd_e_std,
             "reward/intrinsic_batch_std": batch_std_i,
             "reward/intrinsic_batch_max": batch_max_i,
             "reward/intrinsic_batch_min": batch_min_i,
-            "reward/extrinsic_batch_mean": batch_mean_e,
             "reward/extrinsic_batch_std": batch_std_e,
             "reward/extrinsic_batch_max": batch_max_e,
             "reward/extrinsic_batch_sum": batch_sum_e,
@@ -710,11 +720,6 @@ if __name__ == '__main__':
             "reward/novelty_mean": novelty_mean,
             "reward/novelty_std": novelty_std,
             "reward/novelty_max": novelty_max,
-            "loss/policy": pi_loss,
-            "loss/value": v_loss,
-            "loss/entropy": -ent_loss,
-            "loss/dynamics": dynamics_loss,
-            "loss/error_model": error_loss_mean,
             "time/iteration_time": iter_time,
             "time/fps": frame_counter.get() / iter_time,
             "data/episodes_collected": total_episodes,
@@ -738,8 +743,12 @@ if __name__ == '__main__':
         print(f"Timer {iter_time:.1f}s | FPS: {frame_counter.get()/iter_time:.0f}")
         print(f"Policy Loss: {pi_loss:.4f}, Value Loss: {v_loss:.4f}, Entropy: {-ent_loss:.4f}")
         print(f"Dynamics Loss: {dynamics_loss:.6f}, Error Model Loss: {error_loss_mean:.6f}")
-        print(f"Intrinsic (batch): μ={batch_mean_i:.6f}, σ={batch_std_i:.6f}, max={batch_max_i:.6f}")
-        print(f"Extrinsic (batch): μ={batch_mean_e:.3f}, max={batch_max_e:.3f}, sum={batch_sum_e:.1f}")
+        print("--------------------------------")
+        print("Iteration Rollout Rewards:")
+        print(f"Intrinsic raw: μ={batch_mean_i:.6f}, σ={batch_std_i:.6f}, max={batch_max_i:.6f}")
+        print(f"Extrinsic raw: μ={batch_mean_e:.3f}, max={batch_max_e:.3f}, sum={batch_sum_e:.1f}")
+        print(f"Extrinsic scaled: μ={float(np.mean(rwds_e_norm_scaled)):.3f}, max={float(np.max(rwds_e_norm_scaled)):.3f}, sum={float(np.sum(rwds_e_norm_scaled)):.1f}")
+        print(f"Intrinsic scaled: μ={float(np.mean(rwds_i_norm_scaled)):.3f}, max={float(np.max(rwds_i_norm_scaled)):.3f}, sum={float(np.sum(rwds_i_norm_scaled)):.1f}")
         if INTRINSIC_ONLY: print("Note: Training with INTRINSIC_ONLY (extrinsic not used for learning)")
         os.makedirs(f'{debug_dir}/checkpoints', exist_ok=True)
         if (iter_idx + 1) % 25 == 0:
