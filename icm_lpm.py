@@ -161,8 +161,8 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     #game.set_hit_reward(1.0) #hitting barrels also give reward, so disable this
     game.set_death_reward(-1.0)
     game.set_kill_reward(1.0)
-    game.set_armor_reward(0.5)
-    game.set_health_reward(0.5)
+    game.set_armor_reward(0.0)
+    game.set_health_reward(0.0)
     game.set_map_exit_reward(10.0)
     game.set_secret_reward(5.0)
     game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)

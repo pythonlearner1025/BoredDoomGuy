@@ -31,9 +31,29 @@ echo "Activating environment and upgrading pip..."
 source env/bin/activate
 python -m pip install --upgrade pip
 
-# Install requirements
-echo "Installing requirements..."
+# Check for GPU and install appropriate PyTorch
+echo "Checking for GPU..."
+if command -v nvidia-smi &> /dev/null; then
+    echo "GPU detected. Installing CUDA PyTorch..."
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+else
+    echo "No GPU detected. Installing CPU-only PyTorch..."
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+fi
+
+# Install remaining requirements
+echo "Installing remaining requirements..."
 pip install -r requirements.txt
+
+# Download DOOM1.wad if not present
+if [ ! -f "Doom1.WAD" ]; then
+    echo "Downloading DOOM1.wad..."
+    wget https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad
+    mv doom1.wad Doom1.WAD
+    echo "DOOM1.wad downloaded successfully"
+else
+    echo "DOOM1.wad already exists, skipping download"
+fi
 
 echo
 echo "=== Setup Complete ==="
