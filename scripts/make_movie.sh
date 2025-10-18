@@ -5,7 +5,7 @@
 #        ./make_movie.sh --last    - Convert only the most recent iteration
 #        ./make_movie.sh -f        - Force overwrite all existing movies
 
-DEBUG_DIR="/home/minjune/doom/debug"
+DEBUG_BASE_DIR="/home/minjune/doom/debug"
 FORCE_OVERWRITE=false
 
 # Parse command line arguments
@@ -28,10 +28,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Check if debug directory exists
-if [ ! -d "$DEBUG_DIR" ]; then
-    echo "Error: Debug directory not found at $DEBUG_DIR"
+if [ ! -d "$DEBUG_BASE_DIR" ]; then
+    echo "Error: Debug directory not found at $DEBUG_BASE_DIR"
     exit 1
 fi
+
+# Find the latest timestamped directory
+LATEST_TIMESTAMP=$(ls -t "$DEBUG_BASE_DIR" | grep -E '^[0-9]{8}_[0-9]{6}$' | head -1)
+if [ -z "$LATEST_TIMESTAMP" ]; then
+    echo "Error: No timestamped directories found in $DEBUG_BASE_DIR"
+    exit 1
+fi
+
+DEBUG_DIR="$DEBUG_BASE_DIR/$LATEST_TIMESTAMP"
+echo "Using latest training run: $LATEST_TIMESTAMP"
+echo ""
 
 # Determine which directories to process
 if [ "$LAST_ONLY" == "true" ]; then
@@ -50,7 +61,7 @@ fi
 # Process each directory
 for iter_dir in "${iter_dirs[@]}"; do
     if [ -d "$iter_dir" ]; then
-        # Extract the iteration number (e.g., iter_0001)
+        # Extract the iteration number (e.g., iter_0002)
         iter_name=$(basename "$iter_dir")
 
         # Check if there are any current.png frames

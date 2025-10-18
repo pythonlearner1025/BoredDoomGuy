@@ -2,18 +2,18 @@ import os
 import math
 import time
 import torch
+import json
 import random
 import threading
 import multiprocessing
 import torch.nn as nn
 import torch.nn.functional as F
+import vizdoom as vzd
 import numpy as np
 import wandb
+
 from PIL import Image
-
 from queue import Queue
-import vizdoom as vzd
-
 from model import (
     Agent, 
     LPMDynamicsModel, 
@@ -26,12 +26,11 @@ from model import (
     RewardRMS
 )
 
-#os.environ['OMP_NUM_THREADS'] = '1'  # Prevent OpenMP conflicts
-#os.environ['MKL_NUM_THREADS'] = '1'  # Prevent MKL conflicts
-
 ITERS = 1000
 EPOCHS = 3  
-MAX_ROLLOUT_FRAMES = int(4e4)  # Reduced to avoid OOM
+FRAME_SKIP = 4
+FRAME_STACK = 4  # Stack last 4 frames as in the paper
+MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(5e4)  # Reduced to avoid OOM
 MAX_FRAMES_PER_EPISODE = int(37.5*60*3)  # Per-thread 1 minute episode limit
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
@@ -49,20 +48,17 @@ INTRINSIC_ONLY = False  # If True, train with only intrinsic reward (no extrinsi
 INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.1
 EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.9  # Allow sparse extrinsic reward to break ties
 IGNORE_DONES = INTRINSIC_ONLY  # "Death is not the end" - infinite horizon bootstrapping
-FRAME_SKIP = 4
-FRAME_STACK = 4  # Stack last 4 frames as in the paper
 ENCODER_FEATS = 512
 
 # Novelty
-SKIP_FRAMES_NOVELTY = 35  # every second 
 NOVELTY_SIMILARITY_THRESH = 0.9 # lower => ADHD 
-LP_WEIGHT = 0.8
-EPISODIC_WEIGHT = 0.2
+LP_WEIGHT = 1.0
+EPISODIC_WEIGHT = 0.0
+SKIP_FRAMES_NOVELTY = 15 if EPISODIC_WEIGHT > 0 else 1e6 # every 0.5 seconds 
 
 # LPM specific replay/buffer parameters
 ERROR_BUFFER_SIZE = MAX_ROLLOUT_FRAMES * 3
 DYNAMICS_REPLAY_SIZE = MAX_ROLLOUT_FRAMES * 3
-
 ERROR_WARMUP = ERROR_BUFFER_SIZE // 2
 
 DYNAMICS_LEARNING_RATE = 1e-4
@@ -162,11 +158,11 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     wad_path = os.path.join(script_dir, "Doom1.WAD")
     game.set_doom_game_path(wad_path)
     game.set_doom_map("E1M1")
-    game.set_render_hud(True)
+    game.set_render_hud(False)
     game.set_hit_reward(1.0)
-    game.set_kill_reward(5.0)
-    game.set_armor_reward(0.1)
-    game.set_health_reward(0.1)
+    game.set_kill_reward(2.0)
+    game.set_armor_reward(0.5)
+    game.set_health_reward(0.5)
     game.set_map_exit_reward(10.0)
     game.set_secret_reward(5.0)
     game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
@@ -257,7 +253,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
 
                 mse = F.mse_loss(pred_next, phi_next_t, reduction='none')
             mse_flat = mse.view(mse.shape[0], -1).mean(dim=1)
-            epsilon = math.log(mse_flat.item(), EPSILON_CLAMP)
+            epsilon = math.log(max(mse_flat.item(), EPSILON_CLAMP))
         else:
             continue
 
@@ -289,39 +285,18 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         run_rwd_i = run_rwd_i * GAMMA_INT + intrinsic_reward
         run_rwd_e = run_rwd_e * GAMMA_EXT + rwd_e
 
-    # Update stats
     intrinsic_stats, extrinsic_stats = stats
     intrinsic_stats.update(run_rwd_i)
     extrinsic_stats.update(run_rwd_e)
 
-    # Update frame counter atomically
     with frame_counter:
-        frame_counter.count += len(obss)
+        frame_counter.count += len(obss) * FRAME_SKIP
 
     game.close()
 
-    # Put episode data in buffer (include RGB frames for debug)
-    buffer.put(
-        (
-            thread_id,
-            obss,
-            obss_next,
-            acts,
-            logps,
-            vals,
-            rwds_e,
-            rwds_i,
-            epsilons,
-            novelties,
-            learning_progresses,
-            dones,
-            obss_rgb,
-            obss_next_rgb,
-        )
-    )
+    buffer.put((thread_id, obss, obss_next, acts, logps, vals, rwds_e, rwds_i, epsilons, novelties, learning_progresses, dones, obss_rgb, obss_next_rgb))
 
 class FrameCounter:
-    """Thread-safe frame counter."""
     def __init__(self):
         self.count = 0
         self.lock = threading.Lock()
@@ -385,10 +360,10 @@ def init_wandb(config):
 
 if __name__ == '__main__':
     torch.autograd.set_detect_anomaly(True)
-    import shutil
-    if os.path.isdir('debug'):
-        shutil.rmtree('debug')
     os.makedirs('debug', exist_ok=True)
+    from datetime import datetime
+    debug_dir = 'debug/'+datetime.now().strftime('%Y%m%d_%H%M%S')
+    os.makedirs(debug_dir, exist_ok=True)
 
     wandb_config = {
             "iters": ITERS,
@@ -482,22 +457,22 @@ if __name__ == '__main__':
                 total_episodes += 1
 
                 if thread_id == debug_thread_id and not debug_episode_saved and obss_rgb is not None:
-                    debug_dir = f'debug/iter_{iter_idx+1:04d}'
-                    os.makedirs(debug_dir, exist_ok=True)
+                    save_frame_dir = f'{debug_dir}/iter_{iter_idx+1:04d}'
+                    os.makedirs(save_frame_dir)
                     action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
                                     'ATTACK', 'USE', 'FWD_ATK', 'STRAFE_L', 'STRAFE_R']
                     for i, (rgb_curr, rgb_next, act_idx, r_i, r_e, nov, lp) in enumerate(
                         zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e, novelties_ep, learning_progresses_ep)
                     ):
-                        Image.fromarray(rgb_curr, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_current.png')
-                        Image.fromarray(rgb_next, mode='RGB').save(f'{debug_dir}/frame_{i:04d}_next.png')
+                        Image.fromarray(rgb_curr, mode='RGB').save(f'{save_frame_dir}/frame_{i:04d}_current.png')
+                        Image.fromarray(rgb_next, mode='RGB').save(f'{save_frame_dir}/frame_{i:04d}_next.png')
                         action_name = action_names[act_idx] if act_idx < len(action_names) else f'ACT_{act_idx}'
-                        with open(f'{debug_dir}/frame_{i:04d}_{action_name}.txt', 'w') as f:
+                        with open(f'{save_frame_dir}/frame_{i:04d}_{action_name}.txt', 'w') as f:
                             f.write(f'Action: {action_name}\\n')
                             f.write(f'Intrinsic Reward: {r_i:.6f}\\n')
-                            f.write(f'Extrinsic Reward: {r_e:.3f}\\n')
-                            f.write(f'Episodic Novelty: {nov:.6f}\\n')
-                            f.write(f'Learning Progress: {lp:.6f}\\n')
+                            f.write(f'Extrinsic Reward: {r_e:.3f}\n')
+                            f.write(f'Episodic Novelty: {nov:.6f}\n')
+                            f.write(f'Learning Progress: {lp:.6f}\n')
 
                     debug_episode_saved = True
 
@@ -665,7 +640,7 @@ if __name__ == '__main__':
                 error_loss_total += err_loss.item()
                 error_updates += 1
 
-                eps_pred_total += torch.exp(eps_pred).mean().item()
+                eps_pred_total += eps_pred.mean().item()
                 eps_actual_total += eps_b_log.mean().item()
 
             epoch_end = time.time()
@@ -708,13 +683,19 @@ if __name__ == '__main__':
         learning_progress_std = learning_progress_t.std().item() if learning_progress_t.numel() > 0 else 0.0
         learning_progress_max = learning_progress_t.max().item() if learning_progress_t.numel() > 0 else 0.0
 
+        error_buffer.commit_pending()
+
         log_dict = {
             "update_step": iter_idx + 1,
             "reward/intrinsic_running": mean_i_running,
             "reward/extrinsic_running": mean_e_running,
+            "lpm/error_pred_mean": error_pred_mean,
+            "lpm/error_actual": error_actual_mean,
+            "reward/learning_progress_mean": learning_progress_mean,
+            "reward/learning_progress_std": learning_progress_std,
+            "reward/learning_progress_max": learning_progress_max,
             "reward/intrinsic_std_running": std_i_running if not math.isnan(std_i_running) else 0,
             "reward/extrinsic_std_running": std_e_running if not math.isnan(std_e_running) else 0,
-            # Running RMS std used for normalization
             "reward/intrinsic_std_rms": rwd_i_rms.std(),
             "reward/extrinsic_std_rms": rwd_e_rms.std(),
             "reward/intrinsic_batch_mean": batch_mean_i,
@@ -729,19 +710,11 @@ if __name__ == '__main__':
             "reward/novelty_mean": novelty_mean,
             "reward/novelty_std": novelty_std,
             "reward/novelty_max": novelty_max,
-            "reward/learning_progress_mean": learning_progress_mean,
-            "reward/learning_progress_std": learning_progress_std,
-            "reward/learning_progress_max": learning_progress_max,
             "loss/policy": pi_loss,
             "loss/value": v_loss,
             "loss/entropy": -ent_loss,
             "loss/dynamics": dynamics_loss,
-
-            # error stuff
             "loss/error_model": error_loss_mean,
-            "lpm/error_pred": error_pred_mean,
-            "lpm/error_actual": error_actual_mean,
-
             "time/iteration_time": iter_time,
             "time/fps": frame_counter.get() / iter_time,
             "data/episodes_collected": total_episodes,
@@ -755,20 +728,20 @@ if __name__ == '__main__':
             "lpm/epsilon_min": eps_min,
         }
 
+        with open(f'{debug_dir}/log_{iter_idx:04d}.json', 'w') as f:
+            json.dump(log_dict, f)
+
         for k,v in log_dict.items():
             print(k, ": ", v)
         
-        error_buffer.commit_pending()
         wandb.log(log_dict)
-
         print(f"Timer {iter_time:.1f}s | FPS: {frame_counter.get()/iter_time:.0f}")
         print(f"Policy Loss: {pi_loss:.4f}, Value Loss: {v_loss:.4f}, Entropy: {-ent_loss:.4f}")
         print(f"Dynamics Loss: {dynamics_loss:.6f}, Error Model Loss: {error_loss_mean:.6f}")
         print(f"Intrinsic (batch): μ={batch_mean_i:.6f}, σ={batch_std_i:.6f}, max={batch_max_i:.6f}")
         print(f"Extrinsic (batch): μ={batch_mean_e:.3f}, max={batch_max_e:.3f}, sum={batch_sum_e:.1f}")
-        if INTRINSIC_ONLY:
-            print("  ^ Note: Training with INTRINSIC_ONLY (extrinsic not used for learning)")
-
+        if INTRINSIC_ONLY: print("Note: Training with INTRINSIC_ONLY (extrinsic not used for learning)")
+        os.makedirs(f'{debug_dir}/checkpoints', exist_ok=True)
         if (iter_idx + 1) % 25 == 0:
             checkpoint = {
                 'iteration': iter_idx + 1,
@@ -779,8 +752,5 @@ if __name__ == '__main__':
                 'dynamics_optimizer': dynamics_optimizer.state_dict(),
                 'error_optimizer': error_optimizer.state_dict(),
             }
-            torch.save(checkpoint, f'idm_lpm_checkpoint_{iter_idx+1}.pth')
-            print(f"Saved checkpoint at iteration {iter_idx+1}")
-
-    print("\nTraining complete!")
+            torch.save(checkpoint, f'{debug_dir}/checkpoints/idm_lpm_checkpoint_{iter_idx+1}.pth')
     wandb.finish()
