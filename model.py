@@ -7,8 +7,8 @@ import random
 
 from typing import Optional, Tuple
 
-OBS_HEIGHT = 80
-OBS_WIDTH = 60
+OBS_HEIGHT = 60
+OBS_WIDTH = 80
 OBS_CHANNELS = 4
 OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
 
@@ -21,69 +21,109 @@ def mlp(input_dim, hidden_sizes=(128, 128), activation=nn.ReLU):
         layers.append(activation())
         prev_size = hidden_size
     return nn.Sequential(*layers)
+# ============================================================================
+# Neural Network Components
+# ============================================================================
+def get_cnn(in_ch, out_dim):
+    layers = [
+        nn.Conv2d(in_ch, 32, 8, 4), nn.ReLU(),
+        nn.Conv2d(32, 64, 4, 2), nn.ReLU(),
+        nn.Conv2d(64, 64, 3, 1), nn.ReLU(),
+        nn.Flatten(),
+    ]
+    conv = nn.Sequential(*layers)
+    with torch.no_grad():
+        dummy = torch.zeros(1, in_ch, OBS_HEIGHT, OBS_WIDTH)
+        flat_dim = conv(dummy).shape[1]
+    return nn.Sequential(
+        conv,
+        nn.Linear(flat_dim, out_dim)
+    )
 
 class RNDModule(nn.Module):
-    def __init__(self, in_dim, feat_dim=128, hidden=(128, 128)):
+    """
+    CNN-based RND module that operates on image observations shaped (N, C, H, W).
+    Target network is frozen; predictor is trained to match target features.
+    """
+    def __init__(self, in_ch: int, feat_dim: int = 128, conv_out: int = 256):
         super().__init__()
-        self.target = mlp(in_dim, hidden_sizes=hidden)
-        self.predictor = mlp(in_dim, hidden_sizes=hidden)
-        self.target_last = nn.Linear(hidden[-1] if hidden else in_dim, feat_dim)
-        self.predictor_last = nn.Linear(hidden[-1] if hidden else in_dim, feat_dim)
+        # small conv encoders to a shared embedding space
+        self.target_enc = get_cnn(in_ch, conv_out)
+        self.predictor_enc = get_cnn(in_ch, conv_out)
+        self.target_proj = nn.Linear(conv_out, feat_dim)
+        self.predictor_proj = nn.Linear(conv_out, feat_dim)
 
-        for p in self.target.parameters():
+        # freeze target parameters
+        for p in self.target_enc.parameters():
             p.requires_grad = False
-        for p in self.target_last.parameters():
+        for p in self.target_proj.parameters():
             p.requires_grad = False
-    
-    def forward(self, obs):
-        target = self.target(obs)
-        predictor = self.predictor(obs)
-        target_last = self.target_last(target)
-        predictor_last = self.predictor_last(predictor)
-        return predictor_last, target_last  
-    
-    def intrinsic_reward(self, obs):
+
+    def _ensure_nchw(self, obs: torch.Tensor) -> torch.Tensor:
+        # Accept either (N, C, H, W) or (N, C*H*W); convert to (N, C, H, W)
+        if obs.dim() == 2:
+            # flatten -> view
+            n = obs.shape[0]
+            return obs.view(n, OBS_CHANNELS, OBS_HEIGHT, OBS_WIDTH)
+        return obs
+
+    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self._ensure_nchw(obs)
+        with torch.no_grad():
+            t_embed = self.target_enc(x)
+        p_embed = self.predictor_enc(x)
+        tfeat = self.target_proj(t_embed)
+        pfeat = self.predictor_proj(p_embed)
+        return pfeat, tfeat
+
+    def intrinsic_reward(self, obs: torch.Tensor) -> torch.Tensor:
+        # returns per-sample mse (N,)
         with torch.no_grad():
             pfeat, tfeat = self.forward(obs)
             mse = torch.mean((pfeat - tfeat) ** 2, dim=-1)
-            return mse
-        
-    def predictor_loss(self, obs):
+        return mse
+
+    def predictor_loss(self, obs: torch.Tensor) -> torch.Tensor:
         pfeat, tfeat = self.forward(obs)
-        loss = torch.mean((pfeat - tfeat) ** 2)
-        return loss
+        return torch.mean((pfeat - tfeat) ** 2)
 
 class RNDAgent(nn.Module):
-    '''
-    Actor-critic policy with:
-    - shared body (MLP)
-    - action head 
-    - intrinsic value head
-    - extrinsic value head
-    - integrated RND module for intrinsic reward
-    '''
-    def __init__(self, obs_dim, n_actions, hidden=(256,256), rnd_feat_dim=128):
+    """
+    Actor-critic policy with a CNN backbone operating on images (C,H,W):
+    - shared conv encoder
+    - action head (categorical)
+    - intrinsic & extrinsic value heads
+    - integrated CNN-based RND module
+    """
+    def __init__(self, obs_dim: int, n_actions: int, hidden: Tuple[int, ...] = (256, 256), rnd_feat_dim: int = 128, conv_out_dim: int = 128):
         super().__init__()
-        self.backbone = mlp(obs_dim, hidden_sizes=hidden)
-        last_hidden = hidden[-1] if len(hidden) else obs_dim
-        self.action_head = nn.Linear(last_hidden, n_actions)
-        self.v_int_head = nn.Linear(last_hidden, 1)
-        self.v_ext_head = nn.Linear(last_hidden, 1)
-        self.rnd = RNDModule(obs_dim, feat_dim=rnd_feat_dim, hidden=(128,))
+        # CNN encoder to a compact feature
+        self.enc = get_cnn(OBS_CHANNELS, 512)
+        self.pi_head = nn.Linear(512, n_actions)
+        self.v_int_head = nn.Linear(512, 1)
+        self.v_ext_head = nn.Linear(512, 1)
+        self.rnd = RNDModule(OBS_CHANNELS, feat_dim=rnd_feat_dim, conv_out=128)
 
-    def forward(self, obs):
-        x = self.backbone(obs)
-        logits = self.action_head(x)
-        v_int = self.v_int_head(x).squeeze(-1)
-        v_ext = self.v_ext_head(x).squeeze(-1)
+    def _ensure_nchw(self, obs: torch.Tensor) -> torch.Tensor:
+        if obs.dim() == 2:
+            n = obs.shape[0]
+            return obs.view(n, OBS_CHANNELS, OBS_HEIGHT, OBS_WIDTH)
+        return obs
+
+    def forward(self, obs: torch.Tensor):
+        x = self._ensure_nchw(obs)
+        z = self.enc(x)
+        logits = self.pi_head(z)
+        v_int = self.v_int_head(z).squeeze(-1)
+        v_ext = self.v_ext_head(z).squeeze(-1)
         return logits, v_int, v_ext
-    
-    def step(self, obs):
+
+    def step(self, obs: torch.Tensor):
         logits, v_int, v_ext = self.forward(obs)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         logp = dist.log_prob(action)
-        return action.item(), logits, logp.item(), v_int.item(), v_ext.item()
+        return int(action.item()), None, float(logp.item()), float(v_int.item()), float(v_ext.item())
 
 # ============================================================================
 # Statistics Tracking
@@ -212,24 +252,7 @@ class EpisodicNoveltyBuffer:
             tensor = torch.zeros_like(tensor)
         return tensor
 
-# ============================================================================
-# Neural Network Components
-# ============================================================================
-def get_cnn(in_ch, out_dim):
-    layers = [
-        nn.Conv2d(in_ch, 32, 8, 4), nn.ReLU(),
-        nn.Conv2d(32, 64, 4, 2), nn.ReLU(),
-        nn.Conv2d(64, 64, 3, 1), nn.ReLU(),
-        nn.Flatten(),
-    ]
-    conv = nn.Sequential(*layers)
-    with torch.no_grad():
-        dummy = torch.zeros(1, in_ch, OBS_HEIGHT, OBS_WIDTH)
-        flat_dim = conv(dummy).shape[1]
-    return nn.Sequential(
-        conv,
-        nn.Linear(flat_dim, out_dim)
-    )
+
 
 class Agent(nn.Module):
     def __init__(self, n_acts):
