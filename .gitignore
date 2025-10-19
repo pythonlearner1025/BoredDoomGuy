@@ -7,6 +7,8 @@ Arnold/
 wandb/
 agent_playback/
 
+*.txt
+!requirements.txt
 test/
 old_debugs/
 LPM_exploration/
