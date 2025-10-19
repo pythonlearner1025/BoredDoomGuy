@@ -12,19 +12,12 @@ import vizdoom as vzd
 import numpy as np
 import wandb
 
+from datetime import datetime
 from PIL import Image
 from queue import Queue
 from model import (
     Agent, 
-    LPMDynamicsModel, 
-    LPMErrorModel, 
-    EpisodicNoveltyBuffer,
-    RandomEncoder, 
-    DynamicsReplayBuffer, 
-    ErrorReplayBuffer, 
     RunningStats,
-    TrainableEncoder,
-    InverseDynamicsModel,
 )
 
 ITERS = 1000
@@ -33,9 +26,7 @@ FRAME_SKIP = 4
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
 MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(1e4)  # Reduced to avoid OOM
 MAX_FRAMES_PER_EPISODE = int(37.5*60*1)  # Per-thread 1 minute episode limit
-GAMMA_INT = 0.99
-GAMMA_EXT = 0.999
-GAE_LAMBDA = 0.95
+
 CLIP_COEF = 0.1
 ENT_COEF_START = 0.03
 ENT_COEF_END = 0.001
@@ -45,33 +36,11 @@ MAX_GRAD_NORM = 1.0
 MINIBATCH_SIZE = 2048
 LEARNING_RATE = 1e-4
 
-INTRINSIC_ONLY = False  # If True, train with only intrinsic reward (no extrinsic)
-INTRINSIC_COEF = 1.0 if INTRINSIC_ONLY else 0.1
-EXTRINSIC_COEF = 0.0 if INTRINSIC_ONLY else 0.9  # Allow sparse extrinsic reward to break ties
-IGNORE_DONES = INTRINSIC_ONLY  # "Death is not the end" - infinite horizon bootstrapping
-ENCODER_FEATS = 512
-
-# Novelty
-NOVELTY_SIMILARITY_THRESH = 0.9 # lower => ADHD 
-LP_WEIGHT = 1.0
-EPISODIC_WEIGHT = 0.0
-SKIP_FRAMES_NOVELTY = 15 if EPISODIC_WEIGHT > 0 else 1e6 # every 0.5 seconds 
-
-# LPM specific replay/buffer parameters
-ERROR_BUFFER_SIZE = (MAX_ROLLOUT_FRAMES * 3) // FRAME_SKIP
-DYNAMICS_REPLAY_SIZE = (MAX_ROLLOUT_FRAMES * 3) // FRAME_SKIP
-ERROR_WARMUP = ERROR_BUFFER_SIZE // 2
-
-DYNAMICS_LEARNING_RATE = 1e-4
-ERROR_LEARNING_RATE = 1e-4
-FEAT_LEARNING_RATE = 1e-4
-
-DYNAMICS_GRAD_STEPS = 10
-ERROR_GRAD_STEPS = 10
-
-LPM_HIDDEN = 512
-DYNAMICS_BATCH_SIZE = 512
-ERROR_BATCH_SIZE = 512
+GAMMA_INT = 0.99
+GAMMA_EXT = 0.999
+GAE_LAMBDA = 0.95
+INTRINSIC_COEF = 0.5
+EXTRINSIC_COEF = 0.5
 
 EPSILON_CLAMP = 1e-8
 OBS_HEIGHT = 60
@@ -100,6 +69,42 @@ BUTTONS_ORDER = sorted(
     key=lambda b: b.value
 )
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+cpus = multiprocessing.cpu_count()-4
+n_threads = max(1, cpus - 2)
+print(f"Using {n_threads} worker threads")
+
+n_actions = len(MACRO_ACTIONS)
+
+torch.autograd.set_detect_anomaly(True)
+os.makedirs('debug', exist_ok=True)
+debug_dir = 'debug/'+datetime.now().strftime('%Y%m%d_%H%M%S')
+os.makedirs(debug_dir, exist_ok=True)
+
+wandb_config = {
+        "iters": ITERS,
+        "epochs": EPOCHS,
+        "max_rollout_frames": MAX_ROLLOUT_FRAMES,
+        "max_frames_per_episode": MAX_FRAMES_PER_EPISODE,
+        "gamma_int": GAMMA_INT,
+        "gamma_ext": GAMMA_EXT,
+        "gae_lambda": GAE_LAMBDA,
+        "clip_coef": CLIP_COEF,
+        "ent_coef": ENT_COEF,
+        "vf_coef": VF_COEF,
+        "max_grad_norm": MAX_GRAD_NORM,
+        "minibatch_size": MINIBATCH_SIZE,
+        "policy_lr": LEARNING_RATE,
+        "intrinsic_coef": INTRINSIC_COEF,
+        "extrinsic_coef": EXTRINSIC_COEF,
+        "frame_skip": FRAME_SKIP,
+        "frame_stack": FRAME_STACK,
+        "n_actions": len(MACRO_ACTIONS),
+}
+
+
 def compute_gae(rewards, values, dones, next_value, gamma, gae_lambda):
     T, N = rewards.shape
     device = rewards.device
@@ -111,11 +116,7 @@ def compute_gae(rewards, values, dones, next_value, gamma, gae_lambda):
         else:
             nextvalues = values[t+1]
 
-        if IGNORE_DONES:
-            nextnonterminal = torch.ones(N, device=device)
-        else:
-            nextnonterminal = (~dones[t]).float()
-
+        nextnonterminal = (~dones[t]).float()
         delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
         lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
         advantages[t] = lastgaelam
@@ -154,8 +155,8 @@ def stack_frames(frame_buffer, new_frame):
         frame_buffer = frame_buffer[1:] + [gray_frame]  # Shift and append
         return frame_buffer
        
-def run_episode(thread_id, agent, fwd_model, err_model, enc_model, buffer, stats, frame_counter,
-                error_ready, save_rgb_debug, device='cpu'):
+def run_episode(thread_id, agent, buffer, rwd_i_rms, frame_counter,
+                save_rgb_debug, device='cpu'):
     game = vzd.DoomGame()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     wad_path = os.path.join(script_dir, "Doom1.WAD")
@@ -176,19 +177,14 @@ def run_episode(thread_id, agent, fwd_model, err_model, enc_model, buffer, stats
     game.set_available_buttons(BUTTONS_ORDER)
     game.init()
     game.new_episode()
-    novelty_buffer = EpisodicNoveltyBuffer(embedding_dim=ENCODER_FEATS, similarity_threshold=NOVELTY_SIMILARITY_THRESH, device=device)
-    novelty_buffer.reset()
 
     obss, obss_next = [], []  # Stacked frames (4, H, W) uint8 grayscale
     obss_rgb = [] if save_rgb_debug else None
     obss_next_rgb = [] if save_rgb_debug else None
-    acts, logps, vals, rwds_e, rwds_i, novelties, learning_progresses, dones, epsilons = [], [], [], [], [], [], [], [], []
+    acts, logps, vals_int, vals_ext, rwds_e, rwds_i, dones = [], [], [], [], [], [], []
 
-    n_actions = len(MACRO_ACTIONS)
     frames_collected = 0
     frame_buffer = []
-    novelty_counter = SKIP_FRAMES_NOVELTY - 1  
-    last_novelty = 1.0
 
     while frames_collected < MAX_FRAMES_PER_EPISODE:
         if game.is_episode_finished():
@@ -207,35 +203,10 @@ def run_episode(thread_id, agent, fwd_model, err_model, enc_model, buffer, stats
         obs_t = torch.tensor(obs_stacked_np, dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
-            logits, val = agent.forward(obs_t)
-            dist = torch.distributions.Categorical(logits=logits)
+            acts, logp, v_int, v_ext, entropy = agent.step(obs_t)
+            dist = torch.distributions.Categorical(logits=logp)
             act_idx = dist.sample()
-            logp = dist.log_prob(act_idx)
-
-        act_idx_item = act_idx.item()
-        act_onehot = F.one_hot(act_idx, n_actions).float().unsqueeze(0)
-
-        with torch.no_grad():
-            obs_stack_tensor = torch.tensor(obs_stacked_np, dtype=torch.float32, device=device).unsqueeze(0)
-            phi_t = enc_model(obs_stack_tensor)
-
-        novelty_counter += 1
-        if novelty_counter >= SKIP_FRAMES_NOVELTY:
-            phi_features = phi_t.squeeze(0)
-            episodic_novelty = novelty_buffer.compute_novelty(phi_features)
-            novelty_buffer.add(phi_features)
-            phi_cpu = phi_features.detach().cpu().numpy()
-            norm = np.linalg.norm(phi_cpu)
-            if norm > 0:
-                phi_cpu = phi_cpu / norm
-            novelty_counter = 0
-            last_novelty = episodic_novelty
-        else:
-            episodic_novelty = last_novelty
-
-        with torch.no_grad():
-            pred_phi_t_next = fwd_model(phi_t, act_onehot)
-            expected_error_log = err_model(phi_t, act_onehot).item()
+            act_idx_item = act_idx.item()
 
         action_buttons = MACRO_ACTIONS[act_idx_item]
         action_vector = [btn in action_buttons for btn in BUTTONS_ORDER]
@@ -249,22 +220,9 @@ def run_episode(thread_id, agent, fwd_model, err_model, enc_model, buffer, stats
             raw_frame_next_hwc = raw_frame_next.transpose(1, 2, 0)  # (H, W, 3)
             frame_buffer_next = stack_frames(frame_buffer, raw_frame_next)
             obs_next_stacked_np = np.stack(frame_buffer_next, axis=0)  # (4, H, W) grayscale
-
-            with torch.no_grad():
-                obs_t_next = torch.tensor(obs_next_stacked_np, dtype=torch.float32, device=device).unsqueeze(0)
-                phi_t_next = enc_model(obs_t_next)
-
-                mse = F.mse_loss(pred_phi_t_next, phi_t_next, reduction='none')
-            mse_flat = mse.view(mse.shape[0], -1).mean(dim=1)
-            epsilon = math.log(max(mse_flat.item(), EPSILON_CLAMP))
         else:
             continue
 
-        learning_progress = max(expected_error_log - epsilon, 0.0) if error_ready else 0.0
-        rwd_i = (
-            LP_WEIGHT * learning_progress +
-            EPISODIC_WEIGHT * episodic_novelty
-        )
         obss.append(obs_stacked_np.astype(np.uint8))
         obss_next.append(obs_next_stacked_np.astype(np.uint8))
 
@@ -274,13 +232,10 @@ def run_episode(thread_id, agent, fwd_model, err_model, enc_model, buffer, stats
 
         acts.append(act_idx_item)
         logps.append(logp.item())
-        vals.append(val.item())
+        vals_int.append(v_int.item())
+        vals_ext.append(v_ext.item())
         rwds_e.append(rwd_e)
-        rwds_i.append(rwd_i)
-        novelties.append(episodic_novelty)
-        learning_progresses.append(learning_progress)
         dones.append(done_flag)
-        epsilons.append(epsilon)
 
         frames_collected += FRAME_SKIP
 
@@ -289,7 +244,7 @@ def run_episode(thread_id, agent, fwd_model, err_model, enc_model, buffer, stats
 
     game.close()
 
-    buffer.put((thread_id, obss, obss_next, acts, logps, vals, rwds_e, rwds_i, epsilons, novelties, learning_progresses, dones, obss_rgb, obss_next_rgb))
+    buffer.put((thread_id, obss, obss_next, acts, logps, vals_int, vals_ext, rwds_e, dones, obss_rgb, obss_next_rgb))
 
 class FrameCounter:
     def __init__(self):
@@ -311,15 +266,15 @@ class FrameCounter:
         with self.lock:
             self.count = 0
 
-def run_parallel_episodes(n_threads, agent, fwd_model, err_model, enc_model, buffer, stats, frame_counter,
-                         error_ready, debug_thread_id, device='cpu'):
+def run_parallel_episodes(n_threads, agent, buffer, rwd_i_rms, frame_counter,
+                         debug_thread_id, device='cpu'):
     threads = []
     for tid in range(n_threads):
         save_rgb = (tid == debug_thread_id)  # Only one thread saves RGB
         t = threading.Thread(
             target=run_episode,
-            args=(tid, agent, fwd_model, err_model, enc_model, buffer, stats, frame_counter,
-                  error_ready, save_rgb, device)
+            args=(tid, agent, buffer, rwd_i_rms, frame_counter,
+                  save_rgb, device)
         )
         t.start()
         threads.append(t)
@@ -354,73 +309,10 @@ def init_wandb(config):
     return wandb.init(project="doom-idm-curiosity", config=config)
 
 if __name__ == '__main__':
-    torch.autograd.set_detect_anomaly(True)
-    os.makedirs('debug', exist_ok=True)
-    from datetime import datetime
-    debug_dir = 'debug/'+datetime.now().strftime('%Y%m%d_%H%M%S')
-    os.makedirs(debug_dir, exist_ok=True)
-
-    wandb_config = {
-            "iters": ITERS,
-            "epochs": EPOCHS,
-            "max_rollout_frames": MAX_ROLLOUT_FRAMES,
-            "max_frames_per_episode": MAX_FRAMES_PER_EPISODE,
-            "gamma_int": GAMMA_INT,
-            "gamma_ext": GAMMA_EXT,
-            "gae_lambda": GAE_LAMBDA,
-            "clip_coef": CLIP_COEF,
-            "ent_coef": ENT_COEF,
-            "vf_coef": VF_COEF,
-            "max_grad_norm": MAX_GRAD_NORM,
-            "minibatch_size": MINIBATCH_SIZE,
-            "policy_lr": LEARNING_RATE,
-            "dynamics_lr": DYNAMICS_LEARNING_RATE,
-            "error_lr": ERROR_LEARNING_RATE,
-            "intrinsic_coef": INTRINSIC_COEF,
-            "extrinsic_coef": EXTRINSIC_COEF,
-            "intrinsic_only": INTRINSIC_ONLY,
-            "ignore_dones": IGNORE_DONES,
-            "frame_skip": FRAME_SKIP,
-            "frame_stack": FRAME_STACK,
-            "error_buffer_size": ERROR_BUFFER_SIZE,
-            "error_warmup": ERROR_WARMUP,
-            "dynamics_replay_size": DYNAMICS_REPLAY_SIZE,
-            "dynamics_batch_size": DYNAMICS_BATCH_SIZE,
-            "error_batch_size": ERROR_BATCH_SIZE,
-            "dynamics_grad_steps": DYNAMICS_GRAD_STEPS,
-            "error_grad_steps": ERROR_GRAD_STEPS,
-            "epsilon_clamp": EPSILON_CLAMP,
-            "n_actions": len(MACRO_ACTIONS),
-            "python_version": "3.14t",
-            "gil_disabled": True,
-    }
     init_wandb(wandb_config)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    cpus = multiprocessing.cpu_count()-4
-    n_threads = max(1, cpus - 2)
-    print(f"Using {n_threads} worker threads")
-
-    n_actions = len(MACRO_ACTIONS)
     agent = Agent(n_actions).to(device)
-    fwd_model = LPMDynamicsModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
-    err_model = LPMErrorModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
-    enc_model = TrainableEncoder(out_dim=ENCODER_FEATS, in_ch=FRAME_STACK).to(device)
-    idm_model = InverseDynamicsModel(ENCODER_FEATS, n_actions, hidden=LPM_HIDDEN).to(device)
-
     agent_optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
-    dynamics_optimizer = torch.optim.Adam(fwd_model.parameters(), lr=DYNAMICS_LEARNING_RATE)
-    error_optimizer = torch.optim.Adam(err_model.parameters(), lr=ERROR_LEARNING_RATE)
-    joint_optimizer = torch.optim.Adam(list(enc_model.parameters()) + list(idm_model.parameters()), lr=FEAT_LEARNING_RATE)
-
-    dynamics_buffer = DynamicsReplayBuffer(DYNAMICS_REPLAY_SIZE)
-    error_buffer = ErrorReplayBuffer(ERROR_BUFFER_SIZE)
-    # Running RMS normalizers for rewards (as in Burda et al.)
     rwd_i_rms = RunningStats()
-    rwd_e_rms = RunningStats()
-    stats = (rwd_i_rms, rwd_e_rms)
 
     for iter_idx in range(ITERS):
         print(f"\n=== Iteration {iter_idx+1}/{ITERS} ===")
@@ -429,27 +321,21 @@ if __name__ == '__main__':
         buffer = Queue()
         frame_counter = FrameCounter()
         debug_thread_id = random.randint(0, n_threads - 1)
-        error_ready = len(error_buffer) >= ERROR_WARMUP
 
-        all_obs, all_obs_next, all_acts, all_logps, all_advantages, all_returns, all_dones, all_rwds_i_raw, all_rwds_e_raw, all_epsilons, all_novelties, all_learning_progress = [], [], [], [], [], [], [], [], [], [], [], []
+        all_obs, all_obs_next, all_acts, all_logps, all_advantages, all_returns, all_dones, all_rwds_i_raw, all_rwds_e_raw = [], [], [], [], [], [], [], [], [], []
         debug_episode_saved = False
         total_episodes = 0
         episodes_data = []
 
-        fwd_model.eval()
-        err_model.eval()
-        enc_model.eval()
-
         while frame_counter.get() < MAX_ROLLOUT_FRAMES:
             run_parallel_episodes(
-                n_threads, agent, fwd_model, err_model, enc_model,
-                buffer, stats, frame_counter, error_ready, debug_thread_id, device
+                n_threads, agent, buffer, rwd_i_rms, frame_counter, debug_thread_id, device
             )
 
             while not buffer.empty():
                 ep = buffer.get()
-                (thread_id, obss, obss_next, acts, logps, vals,
-                 rwds_e, rwds_i, epsilons_ep, novelties_ep, learning_progresses_ep, dones,
+                (thread_id, obss, obss_next, acts, logps, vals_int, vals_ext,
+                 rwds_e, rwds_i, dones,
                  obss_rgb, obss_next_rgb) = ep
                 total_episodes += 1
 
@@ -458,8 +344,8 @@ if __name__ == '__main__':
                     os.makedirs(save_frame_dir)
                     action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
                                     'ATTACK', 'USE', 'FWD_ATK', 'STRAFE_L', 'STRAFE_R']
-                    for i, (rgb_curr, rgb_next, act_idx, r_i, r_e, nov, lp) in enumerate(
-                        zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e, novelties_ep, learning_progresses_ep)
+                    for i, (rgb_curr, rgb_next, act_idx, r_i, r_e) in enumerate(
+                        zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e)
                     ):
                         Image.fromarray(rgb_curr, mode='RGB').save(f'{save_frame_dir}/frame_{i:04d}_current.png')
                         Image.fromarray(rgb_next, mode='RGB').save(f'{save_frame_dir}/frame_{i:04d}_next.png')
@@ -468,8 +354,6 @@ if __name__ == '__main__':
                             f.write(f'Action: {action_name}\\n')
                             f.write(f'Intrinsic Reward: {r_i:.6f}\\n')
                             f.write(f'Extrinsic Reward: {r_e:.3f}\n')
-                            f.write(f'Episodic Novelty: {nov:.6f}\n')
-                            f.write(f'Learning Progress: {lp:.6f}\n')
 
                     debug_episode_saved = True
 
@@ -477,35 +361,35 @@ if __name__ == '__main__':
                 obs_next_ep = torch.tensor(np.array(obss_next), dtype=torch.uint8)
                 acts_ep = torch.tensor(acts, dtype=torch.long)
                 logps_ep = torch.tensor(logps, dtype=torch.float32)
-                vals_ep = torch.tensor(vals, dtype=torch.float32)
+                vals_int_ep = torch.tensor(vals_int, dtype=torch.float32)
+                vals_ext_ep = torch.tensor(vals_ext, dtype=torch.float32)
                 rwds_e_ep = torch.tensor(rwds_e, dtype=torch.float32)
                 rwds_i_ep = torch.tensor(rwds_i, dtype=torch.float32)
-                eps_ep = torch.tensor(epsilons_ep, dtype=torch.float32)
-                novelty_ep = torch.tensor(novelties_ep, dtype=torch.float32)
-                learning_progress_ep = torch.tensor(learning_progresses_ep, dtype=torch.float32)
                 dones_ep = torch.tensor(dones, dtype=torch.bool)
 
+                # TODO don't understand bootstrapping, check back later
                 with torch.no_grad():
-                    if IGNORE_DONES or not dones_ep[-1]:
+                    if not dones_ep[-1]:
                         obs_next_last = obs_next_ep[-1].float().to(device).unsqueeze(0)
-                        _, next_val = agent.forward(obs_next_last)
-                        next_val = next_val[0].cpu()
+                        acts, logp, v_int, v_ext, entropy = agent.step(obs_next_last)
+                        next_val_int = v_int[0].cpu()
+                        next_val_ext = v_ext[0].cpu()
                     else:
-                        next_val = torch.tensor(0.0)
+                        next_val_int = torch.tensor(0.0)
+                        next_val_ext = torch.tensor(0.0)
 
                 episodes_data.append({
                     "obs": obs_ep,
                     "obs_next": obs_next_ep,
                     "acts": acts_ep,
                     "logps": logps_ep,
-                    "vals": vals_ep,
+                    "vals_int": vals_int_ep,
+                    "vals_ext": vals_ext_ep,
                     "rwds_e": rwds_e_ep,
                     "rwds_i": rwds_i_ep,
-                    "eps": eps_ep,
-                    "novelty": novelty_ep,
-                    "learning_progress": learning_progress_ep,
                     "dones": dones_ep,
-                    "next_val": next_val,
+                    "next_val_int": next_val_int,
+                    "next_val_ext": next_val_ext,
                 })
 
                 rwd_i_rms.update(sum(rwds_i)/len(rwds_i))
@@ -516,19 +400,13 @@ if __name__ == '__main__':
 
                 del ep, obss, obss_next, obss_rgb, obss_next_rgb
 
-        fwd_model.train()
-        err_model.train()
-        idm_model.train()
-        enc_model.train()
-
         print(f"Collected {total_episodes} episodes, {frame_counter.get()} frames")
 
         _, _, rwd_i_std = rwd_i_rms.get()
         _, _, rwd_e_std = rwd_e_rms.get()
 
         intrinsic_scale = max(float(rwd_i_std), 1e-3) if all_rwds_i_raw else 1.0
-        # don't normalize extrinsic rewards: https://github.com/openai/random-network-distillation/blob/master/ppo_agent.py
-        extrinsic_scale = 1.0#max(float(rwd_e_std), 1e-3) if all_rwds_e_raw else 1.0
+        extrinsic_scale = max(float(rwd_e_std), 1e-3) if all_rwds_e_raw else 1.0
 
         rwds_e_norm_scaled = []
         rwds_i_norm_scaled = []
@@ -557,9 +435,6 @@ if __name__ == '__main__':
             all_advantages.append(advs_ep.squeeze(1))
             all_returns.append(rets_ep.squeeze(1))
             all_dones.append(episode["dones"])
-            all_epsilons.append(episode["eps"])
-            all_novelties.append(episode["novelty"])
-            all_learning_progress.append(episode["learning_progress"])
 
         obs_t = torch.cat(all_obs, dim=0)
         obs_t_next = torch.cat(all_obs_next, dim=0)
@@ -568,14 +443,6 @@ if __name__ == '__main__':
         advantages = torch.cat(all_advantages, dim=0)
         returns = torch.cat(all_returns, dim=0)
         dones_t = torch.cat(all_dones, dim=0)
-        eps_t = torch.cat(all_epsilons, dim=0)
-        novelty_t = torch.cat(all_novelties, dim=0) if all_novelties else torch.empty(0, dtype=torch.float32)
-        learning_progress_t = torch.cat(all_learning_progress, dim=0) if all_learning_progress else torch.empty(0, dtype=torch.float32)
-
-        dynamics_buffer.extend(obs_t.cpu().numpy(),acts_t.cpu().numpy(),obs_t_next.cpu().numpy())
-        error_buffer.extend(obs_t.cpu().numpy(), acts_t.cpu().numpy(), eps_t.cpu().numpy())
-
-        if iter_idx == 0: error_buffer.commit_pending()
 
         n_samples = len(obs_t)
         indices = np.arange(n_samples)
@@ -605,87 +472,12 @@ if __name__ == '__main__':
                 total_ent_loss += ent_loss
                 n_updates += 1
 
-            for _ in range(DYNAMICS_GRAD_STEPS):
-                if len(dynamics_buffer) < DYNAMICS_BATCH_SIZE:
-                    break
-                obs_b, act_b, obs_b_next = dynamics_buffer.sample(DYNAMICS_BATCH_SIZE)
-                obs_b = obs_b.to(device)
-                obs_b_next = obs_b_next.to(device)
-                act_onehot = F.one_hot(act_b.to(device), n_actions).float()
-
-                with torch.no_grad():
-                    phi_obs = enc_model(obs_b)
-                    phit_t_next = enc_model(obs_b_next)
-
-                pred_phi_t_next = fwd_model(phi_obs.detach(), act_onehot)
-                dyn_loss = F.mse_loss(pred_phi_t_next, phit_t_next)
-
-                dynamics_optimizer.zero_grad(set_to_none=True)
-                dyn_loss.backward()
-                nn.utils.clip_grad_norm_(fwd_model.parameters(), MAX_GRAD_NORM)
-                dynamics_optimizer.step()
-
-                total_dynamics_loss += dyn_loss.item()
-                dynamics_updates += 1
-
-                phi_obs = enc_model(obs_b)
-                phi_obs_next = enc_model(obs_b_next)
-                pred_act_b = idm_model(phi_obs, phit_t_next)
-                idm_loss = F.cross_entropy(pred_act_b, act_b, reduction="none").mean()
-
-                phi_pred_enc = fwd_model(phi_obs, act_onehot)
-                joint_fwd_loss = F.mse_loss(phi_pred_enc, phi_obs_next.detach(), reduction='none').mean(dim=1).mean()
-
-                beta = 0.20
-                joint_loss = (1 - beta) * idm_loss + beta * joint_fwd_loss
-                joint_loss.backward()
-                nn.utils.clip_grad_norm_(enc_model.parameters(), MAX_GRAD_NORM)
-                nn.utils.clip_grad_norm_(idm_model.parameters(), MAX_GRAD_NORM)
-                joint_optimizer.step()
-
-                idm_loss_total += idm_loss.item()
-                joint_loss_total += joint_loss.item()
-
-            for _ in range(ERROR_GRAD_STEPS):
-                if len(error_buffer) < ERROR_BATCH_SIZE:
-                    break
-                obs_b, act_b, eps_b_log = error_buffer.sample(ERROR_BATCH_SIZE)
-                obs_b = obs_b.to(device)
-                act_onehot = F.one_hot(act_b.to(device), n_actions).float()
-                # eps_b is already logged in rollout
-                eps_b_log = eps_b_log.to(device)
-
-                with torch.no_grad():
-                    phi_obs = enc_model(obs_b)
-
-                eps_pred = err_model(phi_obs, act_onehot)
-                err_loss = F.mse_loss(eps_pred, eps_b_log)
-
-                error_optimizer.zero_grad(set_to_none=True)
-                err_loss.backward()
-                nn.utils.clip_grad_norm_(err_model.parameters(), MAX_GRAD_NORM)
-                error_optimizer.step()
-
-                error_loss_total += err_loss.item()
-                error_updates += 1
-
-                eps_pred_total += eps_pred.mean().item()
-                eps_actual_total += eps_b_log.mean().item()
-
             epoch_end = time.time()
             print(f"EPOCH {epoch} took {(epoch_end - epoch_start):0.2f}s")
 
         pi_loss = total_pi_loss / max(n_updates, 1)
         v_loss = total_v_loss / max(n_updates, 1)
         ent_loss = total_ent_loss / max(n_updates, 1)
-        dynamics_loss = total_dynamics_loss / max(dynamics_updates, 1) if dynamics_updates else 0.0
-        idm_updates = joint_updates = dynamics_updates
-        idm_loss_mean = idm_loss_total / max(idm_updates, 1) if idm_updates else 0.0
-        joint_loss_mean = joint_loss_total / max(joint_updates, 1) if joint_updates else 0.0
-        # log these to track error prediction sanity
-        error_loss_mean = error_loss_total / max(error_updates, 1) if error_updates else 0.0
-        error_pred_mean = eps_pred_total / max(error_updates, 1) if error_updates else 0.0
-        error_actual_mean = eps_actual_total / max(error_updates, 1) if error_updates else 0.0
 
         iter_time = time.time() - iter_start
         _, mean_i_running, std_i_running = rwd_i_rms.get()
@@ -704,24 +496,8 @@ if __name__ == '__main__':
         total_reward = EXTRINSIC_COEF * mean_e_running + INTRINSIC_COEF * mean_i_running
         batch_total = EXTRINSIC_COEF * batch_mean_e + INTRINSIC_COEF * batch_mean_i
 
-        eps_mean = eps_t.mean().item() if len(eps_t) > 0 else 0.0
-        eps_std = eps_t.std().item() if len(eps_t) > 0 else 0.0
-        eps_max = eps_t.max().item() if len(eps_t) > 0 else 0.0
-        eps_min = eps_t.min().item() if len(eps_t) > 0 else 0.0
-        novelty_mean = novelty_t.mean().item() if novelty_t.numel() > 0 else 0.0
-        novelty_std = novelty_t.std().item() if novelty_t.numel() > 0 else 0.0
-        novelty_max = novelty_t.max().item() if novelty_t.numel() > 0 else 0.0
-        learning_progress_mean = learning_progress_t.mean().item() if learning_progress_t.numel() > 0 else 0.0
-        learning_progress_std = learning_progress_t.std().item() if learning_progress_t.numel() > 0 else 0.0
-        learning_progress_max = learning_progress_t.max().item() if learning_progress_t.numel() > 0 else 0.0
-
-        error_buffer.commit_pending()
-
         log_dict = {
             "update_step": iter_idx + 1,
-            "lpm/error_pred_mean": error_pred_mean,
-            "lpm/error_actual": error_actual_mean,
-            "reward/learning_progress_mean": learning_progress_mean,
             "reward/intrinsic_batch_mean": batch_mean_i,
             "reward/extrinsic_batch_mean": batch_mean_e,
             "reward/extrinsic_batch_norm_mean": float(np.mean(rwds_e_norm_scaled)),
@@ -729,14 +505,8 @@ if __name__ == '__main__':
             "loss/policy": pi_loss,
             "loss/value": v_loss,
             "loss/entropy": -ent_loss,
-            "loss/dynamics": dynamics_loss,
-            "loss/err_model": error_loss_mean,
-            "loss/idm": idm_loss_mean,
-            "loss/joint": joint_loss_mean,
             "reward/intrinsic_running": mean_i_running,
             "reward/extrinsic_running": mean_e_running,
-            "reward/learning_progress_std": learning_progress_std,
-            "reward/learning_progress_max": learning_progress_max,
             "reward/intrinsic_std_running": std_i_running if not math.isnan(std_i_running) else 0,
             "reward/extrinsic_std_running": std_e_running if not math.isnan(std_e_running) else 0,
             "reward/intrinsic_std_rms": rwd_i_std,
@@ -748,20 +518,10 @@ if __name__ == '__main__':
             "reward/extrinsic_batch_max": batch_max_e,
             "reward/extrinsic_batch_sum": batch_sum_e,
             "reward/total_batch": batch_total,
-            "reward/novelty_mean": novelty_mean,
-            "reward/novelty_std": novelty_std,
-            "reward/novelty_max": novelty_max,
             "time/iteration_time": iter_time,
             "time/fps": frame_counter.get() / iter_time,
             "data/episodes_collected": total_episodes,
             "data/frames_collected": frame_counter.get(),
-            "data/dynamics_buffer": len(dynamics_buffer),
-            "data/error_buffer": len(error_buffer),
-            "data/error_ready": float(error_ready),
-            "lpm/epsilon_mean": eps_mean,
-            "lpm/epsilon_std": eps_std,
-            "lpm/epsilon_max": eps_max,
-            "lpm/epsilon_min": eps_min,
         }
 
         with open(f'{debug_dir}/log_{iter_idx:04d}.json', 'w') as f:
@@ -773,25 +533,18 @@ if __name__ == '__main__':
         wandb.log(log_dict)
         print(f"Timer {iter_time:.1f}s | FPS: {frame_counter.get()/iter_time:.0f}")
         print(f"Policy Loss: {pi_loss:.4f}, Value Loss: {v_loss:.4f}, Entropy: {-ent_loss:.4f}")
-        print(f"IDM Loss: {idm_loss_mean:.6f}, Joint FWD Loss: {joint_loss_mean:.6f}")
-        print(f"Dynamics Loss: {dynamics_loss:.6f}, Error Model Loss: {error_loss_mean:.6f}")
         print("--------------------------------")
         print("Iteration Rollout Rewards:")
         print(f"Intrinsic raw: μ={batch_mean_i:.6f}, σ={batch_std_i:.6f}, max={batch_max_i:.6f}")
         print(f"Extrinsic raw: μ={batch_mean_e:.3f}, max={batch_max_e:.3f}, sum={batch_sum_e:.1f}")
         print(f"Intrinsic scaled: μ={float(np.mean(rwds_i_norm_scaled)):.3f}, max={float(np.max(rwds_i_norm_scaled)):.3f}, sum={float(np.sum(rwds_i_norm_scaled)):.1f}")
         print(f"Extrinsic scaled: μ={float(np.mean(rwds_e_norm_scaled)):.3f}, max={float(np.max(rwds_e_norm_scaled)):.3f}, sum={float(np.sum(rwds_e_norm_scaled)):.1f}")
-        if INTRINSIC_ONLY: print("Note: Training with INTRINSIC_ONLY (extrinsic not used for learning)")
         os.makedirs(f'{debug_dir}/checkpoints', exist_ok=True)
         if (iter_idx + 1) % 25 == 0:
             checkpoint = {
                 'iteration': iter_idx + 1,
                 'agent_state_dict': agent.state_dict(),
-                'dynamics_state_dict': fwd_model.state_dict(),
-                'error_state_dict': err_model.state_dict(),
                 'agent_optimizer': agent_optimizer.state_dict(),
-                'dynamics_optimizer': dynamics_optimizer.state_dict(),
-                'error_optimizer': error_optimizer.state_dict(),
             }
-            torch.save(checkpoint, f'{debug_dir}/checkpoints/idm_lpm_checkpoint_{iter_idx+1}.pth')
+            torch.save(checkpoint, f'{debug_dir}/checkpoints/icm_rnd_checkpoint_{iter_idx+1}.pth')
     wandb.finish()

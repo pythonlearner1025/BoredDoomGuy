@@ -11,6 +11,7 @@ OBS_HEIGHT = 80
 OBS_WIDTH = 60
 OBS_CHANNELS = 4
 OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
+
 # ============================================================================
 # Statistics Tracking
 # ============================================================================
@@ -243,6 +244,37 @@ class RandomEncoder(nn.Module):
         features = self.net(x)
         features = self.bn(features)  # Normalize features for stable curiosity scale
         return features
+
+# Trainable CNN encoder for Inverse Dynamics Model (ICM - Pathak et al. 2017)
+# Learns features that are relevant for predicting actions
+class TrainableEncoder(nn.Module):
+    def __init__(self, in_ch=4, out_dim=512):  # 4 channels for frame stack
+        super().__init__()
+        self.net = get_cnn(in_ch, out_dim)
+        # Add batch norm for feature stability
+        self.bn = nn.BatchNorm1d(out_dim, affine=False)
+        self.bn.eval()  # Keep in eval mode (running stats only)
+
+    def forward(self, x):
+        x = x / 255.0
+        features = self.net(x)
+        features = self.bn(features)
+        return features
+
+# Inverse Dynamics Model: predicts action from (phi(s_t), phi(s_t+1))
+# Used to train the encoder to extract action-relevant features
+class InverseDynamicsModel(nn.Module):
+    def __init__(self, feat_dim, n_actions, hidden=512):
+        super().__init__()
+        self.fc1 = nn.Linear(feat_dim * 2, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fc3 = nn.Linear(hidden, n_actions)
+
+    def forward(self, phi_t, phi_t_next):
+        z = torch.cat([phi_t, phi_t_next], dim=-1)
+        z = F.relu(self.fc1(z))
+        z = F.relu(self.fc2(z))
+        return self.fc3(z)  # Logits for action prediction
 
 class DynamicsReplayBuffer:
     """Fixed-size replay buffer storing transitions for dynamics training."""
