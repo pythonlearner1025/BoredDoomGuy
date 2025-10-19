@@ -98,22 +98,23 @@ We optimise the joint loss to update the encoder and IDM while training the forw
 
 ## 5. `icm_lpm.py` – Learning Progress Monitoring 
 
-Learning Progress Monitoring (LPM)'s key idea is to set reward signal as prediction improvement over training iterations:
+Learning Progress Monitoring (LPM)'s key idea is to set reward signal as prediction improvement over training iterations, where the current iteration is $`\tau`$:
  
-\$\text{rwd}_i = \epsilon^{\tau-1} - \epsilon^{\tau}\$
+$$\text{rwd}_i = \epsilon^{\tau-1} - \epsilon^{\tau}$$
 
-Where $o_{t}$ is the observed state of the game in episode step t, and 
+$`o_{t}`$ is the observed state of the game in episode step t, and
 
-\$\hat{o}_{t} = f_{\text{dynamics}}^{\tau}(o_{t-1}, a_{t-1})\$
-\$\epsilon^{\tau} = \log(\text{MSE}(\hat{o}_{t}, o_{t}))\$
+$$\hat{o}_{t} = f_{\text{dynamics}}^{\tau}(o_{t-1}, a_{t-1})$$
 
-\$\epsilon^{\tau-1}\$ can be naively calculated by using \$f_{\text{dynamics}}^{\tau-1}\$, but we instead train a neural network to predict it directly given the observation and action. 
+$$\epsilon^{\tau} = \log(\text{MSE}(\hat{o}_{t}, o_{t}))$$
+
+$`\epsilon^{\tau-1}`$ can be naively calculated by using $`f_{\text{dynamics}}^{\tau-1}`$, but we instead train a neural network to predict it directly given the observation and action. 
 
 The formulation rewards agents for improved prediction of observation transition dynamics. Let's consier two cases: transitions that are learnable and transitions that are not. 
 
-In the first case, an agent is uncertain about a transition at first but over iterations the forward dynamics model learns, and \$\epsilon^{\tau}\$ approaches zero, and the agent receives reward proportional to its past uncertainty, \$\epsilon^{\tau-1}\$. But since the error prediction model is trained too, \$\epsilon^{\tau-1}\$ approaches zero too, so over many iterations rwd_i for this particular transition approaches zero.  
+In the first case, an agent is uncertain about a transition at first but over iterations the forward dynamics model learns, and $`\epsilon^{\tau}`$ approaches zero, and the agent receives reward proportional to its past uncertainty, $`\epsilon^{\tau-1}`$. But since the error prediction model is trained too, $`\epsilon^{\tau-1}`$ approaches zero too, so over many iterations rwd_i for this particular transition approaches zero.  
 
-In the second case, the transition is purely random and both forward dynamics model and error prediction model's output logits collapse to a uniform distribution and are  equivalent. Therefore, rwd_i is zero. 
+In the second case, the transition is purely random and both forward dynamics model and error prediction model's output logits collapse to a uniform distribution and are  equivalent. Therefore, $`\textrwd_i`$ is zero. 
 
 The above two cases illustrates how, in theory, a LPM model would act out of curiosity (seeks learnable novel dynamics of the world), while avoiding the Noisy TV problem (derives no reward from incompressible/unlearnable dynamics, i.e. random events)
 
