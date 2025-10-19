@@ -16,7 +16,7 @@ from datetime import datetime
 from PIL import Image
 from queue import Queue
 from model import (
-    Agent, 
+    RNDAgent, 
     RunningStats,
 )
 
@@ -24,13 +24,11 @@ ITERS = 1000
 EPOCHS = 3  
 FRAME_SKIP = 4
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
-MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(1e4)  # Reduced to avoid OOM
-MAX_FRAMES_PER_EPISODE = int(37.5*60*1)  # Per-thread 1 minute episode limit
+MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(5e4)  # Reduced to avoid OOM
+MAX_FRAMES_PER_EPISODE = int(37.5*60*2)  # Per-thread 1 minute episode limit
 
 CLIP_COEF = 0.1
-ENT_COEF_START = 0.03
-ENT_COEF_END = 0.001
-ENT_COEF = ENT_COEF_START
+ENT_COEF = 0.03
 VF_COEF = 0.5
 MAX_GRAD_NORM = 1.0
 MINIBATCH_SIZE = 2048
@@ -42,7 +40,7 @@ GAE_LAMBDA = 0.95
 INTRINSIC_COEF = 0.5
 EXTRINSIC_COEF = 0.5
 
-EPSILON_CLAMP = 1e-8
+EPSILON_CLAMP = 1e-6
 OBS_HEIGHT = 60
 OBS_WIDTH = 80
 OBS_CHANNELS = FRAME_STACK
@@ -104,25 +102,14 @@ wandb_config = {
         "n_actions": len(MACRO_ACTIONS),
 }
 
-
-def compute_gae(rewards, values, dones, next_value, gamma, gae_lambda):
-    T, N = rewards.shape
-    device = rewards.device
-    advantages = torch.zeros_like(rewards)
-    lastgaelam = torch.zeros(N, device=device)
-    for t in reversed(range(T)):
-        if t == T - 1:
-            nextvalues = next_value
-        else:
-            nextvalues = values[t+1]
-
-        nextnonterminal = (~dones[t]).float()
-        delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
-        lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
-        advantages[t] = lastgaelam
-
-    returns = advantages + values
-    return advantages, returns
+def init_wandb(config):
+    """Initialize wandb with support for disabled/offline modes."""
+    wandb_mode = os.environ.get("WANDB_MODE", "").lower()
+    wandb_disabled = os.environ.get("WANDB_DISABLED", "").lower()
+    disable = wandb_mode in {"disabled", "offline"} or wandb_disabled in {"true", "1", "yes"}
+    if disable:
+        return wandb.init(mode="disabled", config=config, project="doom-idm-curiosity")
+    return wandb.init(project="doom-idm-curiosity", config=config)
 
 def rgb_to_grayscale(rgb_frame):
     if rgb_frame.shape[0] == 3:
@@ -155,7 +142,7 @@ def stack_frames(frame_buffer, new_frame):
         frame_buffer = frame_buffer[1:] + [gray_frame]  # Shift and append
         return frame_buffer
        
-def run_episode(thread_id, agent, buffer, rwd_i_rms, frame_counter,
+def run_episode(thread_id, agent, buffer, frame_counter,
                 save_rgb_debug, device='cpu'):
     game = vzd.DoomGame()
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -178,10 +165,9 @@ def run_episode(thread_id, agent, buffer, rwd_i_rms, frame_counter,
     game.init()
     game.new_episode()
 
-    obss, obss_next = [], []  # Stacked frames (4, H, W) uint8 grayscale
+    obss = []  # Stacked frames (4, H, W) uint8 grayscale
     obss_rgb = [] if save_rgb_debug else None
-    obss_next_rgb = [] if save_rgb_debug else None
-    acts, logps, vals_int, vals_ext, rwds_e, rwds_i, dones = [], [], [], [], [], [], []
+    acts, logps, vals_int, vals_ext, rwds_e, dones = [], [], [], [], [], []
 
     frames_collected = 0
     frame_buffer = []
@@ -200,40 +186,26 @@ def run_episode(thread_id, agent, buffer, rwd_i_rms, frame_counter,
         raw_frame_hwc = raw_frame.transpose(1, 2, 0)  # Convert to (H, W, 3) for saving
         frame_buffer = stack_frames(frame_buffer, raw_frame)
         obs_stacked_np = np.stack(frame_buffer, axis=0)  # (4, H, W) grayscale uint8
-        obs_t = torch.tensor(obs_stacked_np, dtype=torch.float32, device=device).unsqueeze(0)
+        # Flatten observation for MLP-based agent
+        obs_flat_np = obs_stacked_np.reshape(-1).astype(np.float32)
+        obs_t = torch.tensor(obs_flat_np, dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
-            acts, logp, v_int, v_ext, entropy = agent.step(obs_t)
-            dist = torch.distributions.Categorical(logits=logp)
-            act_idx = dist.sample()
-            act_idx_item = act_idx.item()
+            action, _, logp, v_int, v_ext = agent.step(obs_t)
+            act_idx_item = int(action)
 
         action_buttons = MACRO_ACTIONS[act_idx_item]
         action_vector = [btn in action_buttons for btn in BUTTONS_ORDER]
         rwd_e = game.make_action(action_vector, FRAME_SKIP)
-
-        state_next = game.get_state()
         done_flag = game.is_episode_finished()
 
-        if state_next is not None:
-            raw_frame_next = state_next.screen_buffer
-            raw_frame_next_hwc = raw_frame_next.transpose(1, 2, 0)  # (H, W, 3)
-            frame_buffer_next = stack_frames(frame_buffer, raw_frame_next)
-            obs_next_stacked_np = np.stack(frame_buffer_next, axis=0)  # (4, H, W) grayscale
-        else:
-            continue
-
         obss.append(obs_stacked_np.astype(np.uint8))
-        obss_next.append(obs_next_stacked_np.astype(np.uint8))
-
-        if save_rgb_debug:
-            obss_rgb.append(raw_frame_hwc)
-            obss_next_rgb.append(raw_frame_next_hwc)
+        if save_rgb_debug: obss_rgb.append(raw_frame_hwc)
 
         acts.append(act_idx_item)
-        logps.append(logp.item())
-        vals_int.append(v_int.item())
-        vals_ext.append(v_ext.item())
+        logps.append(float(logp))
+        vals_int.append(float(v_int))
+        vals_ext.append(float(v_ext))
         rwds_e.append(rwd_e)
         dones.append(done_flag)
 
@@ -244,7 +216,17 @@ def run_episode(thread_id, agent, buffer, rwd_i_rms, frame_counter,
 
     game.close()
 
-    buffer.put((thread_id, obss, obss_next, acts, logps, vals_int, vals_ext, rwds_e, dones, obss_rgb, obss_next_rgb))
+    # Compute intrinsic rewards from flattened observations
+    if len(obss) > 0:
+        obss_np = np.array(obss, dtype=np.uint8)  # (T, 4, H, W)
+        obss_flat = obss_np.reshape(obss_np.shape[0], -1).astype(np.float32)
+        obs_t_flat = torch.as_tensor(obss_flat, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            rwds_i_t = agent.rnd.intrinsic_reward(obs_t_flat)
+        rwds_i = rwds_i_t.detach().cpu().numpy().tolist()
+    else:
+        rwds_i = []
+    buffer.put((thread_id, obss, acts, logps, vals_int, vals_ext, rwds_e, rwds_i, dones, obss_rgb))
 
 class FrameCounter:
     def __init__(self):
@@ -266,53 +248,102 @@ class FrameCounter:
         with self.lock:
             self.count = 0
 
-def run_parallel_episodes(n_threads, agent, buffer, rwd_i_rms, frame_counter,
+def run_parallel_episodes(n_threads, agent, buffer, frame_counter,
                          debug_thread_id, device='cpu'):
     threads = []
     for tid in range(n_threads):
         save_rgb = (tid == debug_thread_id)  # Only one thread saves RGB
         t = threading.Thread(
             target=run_episode,
-            args=(tid, agent, buffer, rwd_i_rms, frame_counter,
-                  save_rgb, device)
+            args=(tid, agent, buffer, frame_counter, save_rgb, device)
         )
         t.start()
         threads.append(t)
     for t in threads:
         t.join()
 
-def ppo_update(agent, optimizer, obs_batch, act_batch, old_logp_batch,
-               adv_batch, ret_batch, clip_coef=CLIP_COEF, ent_coef=0.01,
-               vf_coef=VF_COEF):
-    adv_batch = (adv_batch - adv_batch.mean()) / (adv_batch.std() + 1e-8)
-    new_logp, entropy, values = agent.evaluate_actions(obs_batch, act_batch)
-    ratio = (new_logp - old_logp_batch).exp()
-    unclipped = ratio * adv_batch
-    clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_batch
+def ppo_update(agent, optimizer, obs_mb , act_mb, old_logp_mb,
+               adv_mb, ret_int_mb, ret_ext_mb, clip_coef=CLIP_COEF, 
+               ent_coef=0.01, vf_coef=VF_COEF):
+
+    adv_mb = (adv_mb - adv_mb.mean()) / (adv_mb.std() + 1e-8)
+    logits, v_int_new, v_ext_new = agent.forward(obs_mb)
+    dist = torch.distributions.Categorical(logits=logits)
+    # FIXED: Negative log-prob / log-prob sign conventions and ratio
+    logp_new_mb = dist.log_prob(act_mb)
+    entropy = dist.entropy().mean()
+    ratio = (logp_new_mb - old_logp_mb).exp()
+
+    unclipped = ratio * adv_mb
+    clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_mb
     pi_loss = -torch.min(unclipped, clipped).mean()
-    v_loss = 0.5 * F.mse_loss(values, ret_batch)
-    ent_loss = -entropy.mean()
-    loss = pi_loss + vf_coef * v_loss + ent_coef * ent_loss
+
+    v_loss_int = 0.5 * F.mse_loss(v_int_new, ret_int_mb)
+    v_loss_ext = 0.5 * F.mse_loss(v_ext_new, ret_ext_mb)
+    v_loss = v_loss_int + v_loss_ext
+
+    ent_loss = -entropy
+
+    rnd_loss = agent.rnd.predictor_loss(obs_mb).mean()
+
+    total_loss = pi_loss + vf_coef * v_loss + ent_coef * ent_loss + rnd_loss
     optimizer.zero_grad()
-    loss.backward()
+    total_loss.backward()
     nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
     optimizer.step()
-    return pi_loss.item(), v_loss.item(), ent_loss.item()
+    return pi_loss.item(), v_loss.item(), v_loss_int.item(), v_loss_ext.item(), ent_loss.item()
 
-def init_wandb(config):
-    """Initialize wandb with support for disabled/offline modes."""
-    wandb_mode = os.environ.get("WANDB_MODE", "").lower()
-    wandb_disabled = os.environ.get("WANDB_DISABLED", "").lower()
-    disable = wandb_mode in {"disabled", "offline"} or wandb_disabled in {"true", "1", "yes"}
-    if disable:
-        return wandb.init(mode="disabled", config=config, project="doom-idm-curiosity")
-    return wandb.init(project="doom-idm-curiosity", config=config)
+def compute_gae_1d(rewards: torch.Tensor,
+                   values: torch.Tensor,
+                   dones: torch.Tensor,
+                   gamma: float,
+                   gae_lambda: float) -> (torch.Tensor, torch.Tensor):
+    """Compute GAE for a single episode sequence.
+    rewards, values, dones: shape (T,)
+    Returns: advantages, returns of shape (T,)
+    Note: we bootstrap with 0 at the end regardless of done; this is robust and avoids shape issues.
+    """
+    T = rewards.shape[0]
+    device = rewards.device
+    advantages = torch.zeros(T, dtype=torch.float32, device=device)
+    lastgaelam = 0.0
+    for t in reversed(range(T)):
+        if t == T - 1:
+            nextnonterminal = 0.0 if (dones[t].float() > 0.5) else 1.0
+            nextvalues = torch.tensor(0.0, dtype=torch.float32, device=device)
+        else:
+            nextnonterminal = 0.0 if (dones[t+1].float() > 0.5) else 1.0
+            nextvalues = values[t+1]
+        delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
+        lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+        advantages[t] = lastgaelam
+    returns = advantages + values
+    return advantages, returns
+
+def compute_gae(rewards, values, dones, gamma, gae_lambda):
+    T, N = rewards.shape
+    device = rewards.device
+    advantages = torch.zeros_like(rewards)
+    lastgaelam = torch.zeros(N, device=device)
+    for t in reversed(range(T)):
+        if t == T - 1:
+            nextnonterminal = 1.0 - (dones[:, t])
+            nextvalues = values[:, t]  
+        else:
+            nextnonterminal = 1.0 - (dones[:, t+1])
+            nextvalues = values[:, t+1]
+        delta = rewards[:, t] + gamma * nextvalues * nextnonterminal - values[:,    t]
+        lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+        advantages[:, t] = lastgaelam
+
+    returns = advantages + values
+    return advantages, returns
 
 if __name__ == '__main__':
     init_wandb(wandb_config)
-    agent = Agent(n_actions).to(device)
+    agent = RNDAgent(OBS_SIZE, n_actions, hidden=(256,256), rnd_feat_dim=128).to(device)
     agent_optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
-    rwd_i_rms = RunningStats()
+    rff_rms = RunningStats()
 
     for iter_idx in range(ITERS):
         print(f"\n=== Iteration {iter_idx+1}/{ITERS} ===")
@@ -322,21 +353,31 @@ if __name__ == '__main__':
         frame_counter = FrameCounter()
         debug_thread_id = random.randint(0, n_threads - 1)
 
-        all_obs, all_obs_next, all_acts, all_logps, all_advantages, all_returns, all_dones, all_rwds_i_raw, all_rwds_e_raw = [], [], [], [], [], [], [], [], [], []
         debug_episode_saved = False
         total_episodes = 0
-        episodes_data = []
+        rollout_data = {
+            "obs": [],
+            "acts": [],
+            "logps": [],
+            "vals_int": [],
+            "vals_ext": [],
+            "rwds_e": [],
+            "rwds_i": [],
+            "dones": [],
+            "rollout_rwds_i_raw": [],
+            "rollout_rwds_e_raw": [],
+        }
 
         while frame_counter.get() < MAX_ROLLOUT_FRAMES:
             run_parallel_episodes(
-                n_threads, agent, buffer, rwd_i_rms, frame_counter, debug_thread_id, device
+                n_threads, agent, buffer, frame_counter, debug_thread_id, device
             )
 
             while not buffer.empty():
                 ep = buffer.get()
-                (thread_id, obss, obss_next, acts, logps, vals_int, vals_ext,
+                (thread_id, obss, acts, logps, vals_int, vals_ext,
                  rwds_e, rwds_i, dones,
-                 obss_rgb, obss_next_rgb) = ep
+                 obss_rgb) = ep
                 total_episodes += 1
 
                 if thread_id == debug_thread_id and not debug_episode_saved and obss_rgb is not None:
@@ -344,11 +385,10 @@ if __name__ == '__main__':
                     os.makedirs(save_frame_dir)
                     action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
                                     'ATTACK', 'USE', 'FWD_ATK', 'STRAFE_L', 'STRAFE_R']
-                    for i, (rgb_curr, rgb_next, act_idx, r_i, r_e) in enumerate(
-                        zip(obss_rgb, obss_next_rgb, acts, rwds_i, rwds_e)
+                    for i, (rgb_curr, act_idx, r_i, r_e) in enumerate(
+                        zip(obss_rgb, acts, rwds_i, rwds_e)
                     ):
                         Image.fromarray(rgb_curr, mode='RGB').save(f'{save_frame_dir}/frame_{i:04d}_current.png')
-                        Image.fromarray(rgb_next, mode='RGB').save(f'{save_frame_dir}/frame_{i:04d}_next.png')
                         action_name = action_names[act_idx] if act_idx < len(action_names) else f'ACT_{act_idx}'
                         with open(f'{save_frame_dir}/frame_{i:04d}_{action_name}.txt', 'w') as f:
                             f.write(f'Action: {action_name}\\n')
@@ -357,118 +397,125 @@ if __name__ == '__main__':
 
                     debug_episode_saved = True
 
-                obs_ep = torch.tensor(np.array(obss), dtype=torch.uint8)
-                obs_next_ep = torch.tensor(np.array(obss_next), dtype=torch.uint8)
-                acts_ep = torch.tensor(acts, dtype=torch.long)
-                logps_ep = torch.tensor(logps, dtype=torch.float32)
-                vals_int_ep = torch.tensor(vals_int, dtype=torch.float32)
-                vals_ext_ep = torch.tensor(vals_ext, dtype=torch.float32)
-                rwds_e_ep = torch.tensor(rwds_e, dtype=torch.float32)
-                rwds_i_ep = torch.tensor(rwds_i, dtype=torch.float32)
-                dones_ep = torch.tensor(dones, dtype=torch.bool)
-
-                # TODO don't understand bootstrapping, check back later
-                with torch.no_grad():
-                    if not dones_ep[-1]:
-                        obs_next_last = obs_next_ep[-1].float().to(device).unsqueeze(0)
-                        acts, logp, v_int, v_ext, entropy = agent.step(obs_next_last)
-                        next_val_int = v_int[0].cpu()
-                        next_val_ext = v_ext[0].cpu()
-                    else:
-                        next_val_int = torch.tensor(0.0)
-                        next_val_ext = torch.tensor(0.0)
-
-                episodes_data.append({
-                    "obs": obs_ep,
-                    "obs_next": obs_next_ep,
-                    "acts": acts_ep,
-                    "logps": logps_ep,
-                    "vals_int": vals_int_ep,
-                    "vals_ext": vals_ext_ep,
-                    "rwds_e": rwds_e_ep,
-                    "rwds_i": rwds_i_ep,
-                    "dones": dones_ep,
-                    "next_val_int": next_val_int,
-                    "next_val_ext": next_val_ext,
-                })
-
-                rwd_i_rms.update(sum(rwds_i)/len(rwds_i))
-                rwd_e_rms.update(sum(rwds_e)/len(rwds_e))
-
-                all_rwds_i_raw.extend(rwds_i)
-                all_rwds_e_raw.extend(rwds_e)
-
-                del ep, obss, obss_next, obss_rgb, obss_next_rgb
+                # FIXED: don't flatline everything 
+                rollout_data["obs"].append(obss)
+                rollout_data["acts"].append(acts)
+                rollout_data["logps"].append(logps)
+                rollout_data["vals_int"].append(vals_int)
+                rollout_data["vals_ext"].append(vals_ext)
+                rollout_data["rwds_e"].append(rwds_e)
+                rollout_data["rwds_i"].append(rwds_i)
+                rollout_data["dones"].append(dones)
+                rollout_data["rollout_rwds_i_raw"].append(rwds_i)
+                rollout_data["rollout_rwds_e_raw"].append(rwds_e)
+                del ep, obss, obss_rgb
 
         print(f"Collected {total_episodes} episodes, {frame_counter.get()} frames")
 
-        _, _, rwd_i_std = rwd_i_rms.get()
-        _, _, rwd_e_std = rwd_e_rms.get()
+        # Build reward forward filter over all episodes (scalar running stats)
+        filtered_intrinsic_all = []
+        for rw_i_ep in rollout_data["rwds_i"]:
+            rff_state_scalar = 0.0
+            for r in rw_i_ep:
+                rff_state_scalar = rff_state_scalar * GAMMA_INT + float(r)
+                filtered_intrinsic_all.append(rff_state_scalar)
+        if len(filtered_intrinsic_all) > 0:
+            rff_rms.update(torch.tensor(filtered_intrinsic_all, dtype=torch.float32))
+        _, mean_i_running, std_i_running = rff_rms.get()
+        std_i_running = float(std_i_running) if isinstance(std_i_running, (float, int)) else float(torch.as_tensor(std_i_running).item())
+        if not np.isfinite(std_i_running) or std_i_running <= 0.0:
+            std_i_running = 1.0
 
-        intrinsic_scale = max(float(rwd_i_std), 1e-3) if all_rwds_i_raw else 1.0
-        extrinsic_scale = max(float(rwd_e_std), 1e-3) if all_rwds_e_raw else 1.0
+        # Per-episode GAE, then flatten transitions to build dataset
+        flat_obs_list = []
+        flat_acts_list = []
+        flat_oldlogp_list = []
+        flat_adv_list = []
+        flat_ret_i_list = []
+        flat_ret_e_list = []
+        flat_rwds_i_raw = []
+        flat_rwds_e_raw = []
 
-        rwds_e_norm_scaled = []
-        rwds_i_norm_scaled = []
+        for ep_idx in range(len(rollout_data["obs"])):
+            # observations
+            obss_ep = np.array(rollout_data["obs"][ep_idx], dtype=np.uint8)  # (T, 4, H, W)
+            T = obss_ep.shape[0]
+            if T == 0:
+                continue
+            obs_flat_ep = obss_ep.reshape(T, -1).astype(np.float32)
+            acts_ep = torch.tensor(rollout_data["acts"][ep_idx], dtype=torch.long)
+            logps_ep = torch.tensor(rollout_data["logps"][ep_idx], dtype=torch.float32)
+            vals_i_ep = torch.tensor(rollout_data["vals_int"][ep_idx], dtype=torch.float32)
+            vals_e_ep = torch.tensor(rollout_data["vals_ext"][ep_idx], dtype=torch.float32)
+            dones_ep = torch.tensor(rollout_data["dones"][ep_idx], dtype=torch.bool)
+            rwds_e_ep = torch.tensor(rollout_data["rwds_e"][ep_idx], dtype=torch.float32)
+            rwds_i_raw_ep = torch.tensor(rollout_data["rwds_i"][ep_idx], dtype=torch.float32)
 
-        for episode in episodes_data:
-            rwds_e_norm = episode["rwds_e"] / extrinsic_scale
-            rwds_i_norm = torch.clamp(episode["rwds_i"] / intrinsic_scale, max=1.0)
-            total_rwds_ep = EXTRINSIC_COEF * rwds_e_norm + INTRINSIC_COEF * rwds_i_norm
+            # normalize intrinsic rewards by running std of filtered intrinsic
+            rwds_i_norm_ep = rwds_i_raw_ep / std_i_running
 
-            advs_ep, rets_ep = compute_gae(
-                total_rwds_ep.unsqueeze(1),
-                episode["vals"].unsqueeze(1),
-                episode["dones"].unsqueeze(1),
-                episode["next_val"].unsqueeze(0),
-                GAMMA_EXT,  
-                GAE_LAMBDA
-            )
+            adv_e_ep, ret_e_ep = compute_gae_1d(rwds_e_ep, vals_e_ep, dones_ep, GAMMA_EXT, GAE_LAMBDA)
+            adv_i_ep, ret_i_ep = compute_gae_1d(rwds_i_norm_ep, vals_i_ep, dones_ep, GAMMA_INT, GAE_LAMBDA)
+            adv_total_ep = EXTRINSIC_COEF * adv_e_ep + INTRINSIC_COEF * adv_i_ep
 
-            rwds_e_norm_scaled.append(rwds_e_norm * EXTRINSIC_COEF)
-            rwds_i_norm_scaled.append(rwds_i_norm * INTRINSIC_COEF)
+            flat_obs_list.append(torch.tensor(obs_flat_ep, dtype=torch.float32))
+            flat_acts_list.append(acts_ep)
+            flat_oldlogp_list.append(logps_ep)
+            flat_adv_list.append(adv_total_ep)
+            flat_ret_i_list.append(ret_i_ep)
+            flat_ret_e_list.append(ret_e_ep)
+            flat_rwds_i_raw.extend(rwds_i_raw_ep.tolist())
+            flat_rwds_e_raw.extend(rwds_e_ep.tolist())
 
-            all_obs.append(episode["obs"])
-            all_obs_next.append(episode["obs_next"])
-            all_acts.append(episode["acts"])
-            all_logps.append(episode["logps"])
-            all_advantages.append(advs_ep.squeeze(1))
-            all_returns.append(rets_ep.squeeze(1))
-            all_dones.append(episode["dones"])
+        if len(flat_obs_list) == 0:
+            print("No samples collected; skipping update this iteration.")
+            continue
 
-        obs_t = torch.cat(all_obs, dim=0)
-        obs_t_next = torch.cat(all_obs_next, dim=0)
-        acts_t = torch.cat(all_acts, dim=0)
-        logps_t = torch.cat(all_logps, dim=0)
-        advantages = torch.cat(all_advantages, dim=0)
-        returns = torch.cat(all_returns, dim=0)
-        dones_t = torch.cat(all_dones, dim=0)
+        # Concatenate across episodes
+        rollout_obs = torch.cat(flat_obs_list, dim=0).to(device)
+        rollout_acts = torch.cat(flat_acts_list, dim=0).to(device)
+        rollout_logps = torch.cat(flat_oldlogp_list, dim=0).to(device)
+        rollout_advs = torch.cat(flat_adv_list, dim=0).to(device)
+        rollout_rets_i = torch.cat(flat_ret_i_list, dim=0).to(device)
+        rollout_rets_e = torch.cat(flat_ret_e_list, dim=0).to(device)
 
-        n_samples = len(obs_t)
+        # normalize advantages
+        rollout_advs = (rollout_advs - rollout_advs.mean()) / (rollout_advs.std() + 1e-8)
+
+        n_samples = rollout_obs.shape[0]
         indices = np.arange(n_samples)
 
-        total_pi_loss, total_v_loss, total_ent_loss, total_dynamics_loss, error_loss_total, n_updates, dynamics_updates, error_updates = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        eps_pred_total, eps_actual_total = 0.0, 0.0
-        idm_loss_total, joint_loss_total = 0.0, 0.0
+        total_pi_loss, total_v_loss, total_v_loss_i, total_v_loss_e, total_ent_loss, n_updates = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         for epoch in range(EPOCHS):
             np.random.shuffle(indices)
             epoch_start = time.time()
-            ENT_COEF = (1/math.e**(iter_idx/ITERS * math.log(ENT_COEF_START/ENT_COEF_END))) * ENT_COEF_START
-
             for start in range(0, n_samples, MINIBATCH_SIZE):
                 end = min(start + MINIBATCH_SIZE, n_samples)
                 mb_idx = indices[start:end]
+                mb_obs = rollout_obs[mb_idx]
+                mb_acts = rollout_acts[mb_idx]
+                mb_logps = rollout_logps[mb_idx]
+                mb_advs = rollout_advs[mb_idx]
+                mb_rets_i = rollout_rets_i[mb_idx]
+                mb_rets_e = rollout_rets_e[mb_idx]
 
-                mb_obs = obs_t[mb_idx].float().to(device)
-                pi_loss, v_loss, ent_loss = ppo_update(
-                    agent, agent_optimizer,
-                    mb_obs, acts_t[mb_idx].to(device), logps_t[mb_idx].to(device),
-                    advantages[mb_idx].to(device), returns[mb_idx].to(device), ent_coef=ENT_COEF
+                pi_loss, v_loss, v_loss_i, v_loss_e, ent_loss = ppo_update(
+                    agent, 
+                    agent_optimizer, 
+                    mb_obs, 
+                    mb_acts, 
+                    mb_logps, 
+                    mb_advs, 
+                    mb_rets_i, 
+                    mb_rets_e, 
+                    ent_coef=ENT_COEF
                 )
 
                 total_pi_loss += pi_loss
                 total_v_loss += v_loss
+                total_v_loss_i += v_loss_i  
+                total_v_loss_e += v_loss_e
                 total_ent_loss += ent_loss
                 n_updates += 1
 
@@ -477,46 +524,39 @@ if __name__ == '__main__':
 
         pi_loss = total_pi_loss / max(n_updates, 1)
         v_loss = total_v_loss / max(n_updates, 1)
+        v_loss_i = total_v_loss_i / max(n_updates, 1)
+        v_loss_e = total_v_loss_e / max(n_updates, 1)
         ent_loss = total_ent_loss / max(n_updates, 1)
 
         iter_time = time.time() - iter_start
-        _, mean_i_running, std_i_running = rwd_i_rms.get()
-        _, mean_e_running, std_e_running = rwd_e_rms.get()
+        _, mean_i_running, std_i_running = rff_rms.get()
+        batch_mean_i = float(np.mean(flat_rwds_i_raw)) if len(flat_rwds_i_raw) > 0 else 0.0
+        batch_std_i = float(np.std(flat_rwds_i_raw)) if len(flat_rwds_i_raw) > 0 else 0.0
+        batch_max_i = float(np.max(flat_rwds_i_raw)) if len(flat_rwds_i_raw) > 0 else 0.0
+        batch_min_i = float(np.min(flat_rwds_i_raw)) if len(flat_rwds_i_raw) > 0 else 0.0
 
-        batch_mean_i = np.mean(all_rwds_i_raw) if all_rwds_i_raw else 0.0
-        batch_std_i = np.std(all_rwds_i_raw) if all_rwds_i_raw else 0.0
-        batch_max_i = np.max(all_rwds_i_raw) if all_rwds_i_raw else 0.0
-        batch_min_i = np.min(all_rwds_i_raw) if all_rwds_i_raw else 0.0
+        batch_mean_e = float(np.mean(flat_rwds_e_raw)) if len(flat_rwds_e_raw) > 0 else 0.0
+        batch_std_e = float(np.std(flat_rwds_e_raw)) if len(flat_rwds_e_raw) > 0 else 0.0
 
-        batch_mean_e = np.mean(all_rwds_e_raw) if all_rwds_e_raw else 0.0
-        batch_std_e = np.std(all_rwds_e_raw) if all_rwds_e_raw else 0.0
-        batch_max_e = np.max(all_rwds_e_raw) if all_rwds_e_raw else 0.0
-        batch_sum_e = np.sum(all_rwds_e_raw) if all_rwds_e_raw else 0.0
-
-        total_reward = EXTRINSIC_COEF * mean_e_running + INTRINSIC_COEF * mean_i_running
-        batch_total = EXTRINSIC_COEF * batch_mean_e + INTRINSIC_COEF * batch_mean_i
+        total_reward = EXTRINSIC_COEF * batch_mean_e + INTRINSIC_COEF * batch_mean_i
+        batch_total = total_reward
 
         log_dict = {
             "update_step": iter_idx + 1,
             "reward/intrinsic_batch_mean": batch_mean_i,
             "reward/extrinsic_batch_mean": batch_mean_e,
-            "reward/extrinsic_batch_norm_mean": float(np.mean(rwds_e_norm_scaled)),
-            "reward/intrinsic_batch_norm_mean": float(np.mean(rwds_i_norm_scaled)),
             "loss/policy": pi_loss,
             "loss/value": v_loss,
+            "loss/value_i": v_loss_i,
+            "loss/value_e": v_loss_e,
             "loss/entropy": -ent_loss,
-            "reward/intrinsic_running": mean_i_running,
-            "reward/extrinsic_running": mean_e_running,
-            "reward/intrinsic_std_running": std_i_running if not math.isnan(std_i_running) else 0,
-            "reward/extrinsic_std_running": std_e_running if not math.isnan(std_e_running) else 0,
-            "reward/intrinsic_std_rms": rwd_i_std,
-            "reward/extrinsic_std_rms": rwd_e_std,
+            "reward/intrinsic_running": float(mean_i_running),
+            "reward/extrinsic_running": batch_mean_e,
+            "reward/intrinsic_std_running": float(std_i_running) if not math.isnan(float(std_i_running)) else 0.0,
+            "reward/extrinsic_std_running": batch_std_e if 'batch_std_e' in locals() else 0.0,
             "reward/intrinsic_batch_std": batch_std_i,
             "reward/intrinsic_batch_max": batch_max_i,
             "reward/intrinsic_batch_min": batch_min_i,
-            "reward/extrinsic_batch_std": batch_std_e,
-            "reward/extrinsic_batch_max": batch_max_e,
-            "reward/extrinsic_batch_sum": batch_sum_e,
             "reward/total_batch": batch_total,
             "time/iteration_time": iter_time,
             "time/fps": frame_counter.get() / iter_time,
@@ -535,10 +575,11 @@ if __name__ == '__main__':
         print(f"Policy Loss: {pi_loss:.4f}, Value Loss: {v_loss:.4f}, Entropy: {-ent_loss:.4f}")
         print("--------------------------------")
         print("Iteration Rollout Rewards:")
-        print(f"Intrinsic raw: μ={batch_mean_i:.6f}, σ={batch_std_i:.6f}, max={batch_max_i:.6f}")
-        print(f"Extrinsic raw: μ={batch_mean_e:.3f}, max={batch_max_e:.3f}, sum={batch_sum_e:.1f}")
-        print(f"Intrinsic scaled: μ={float(np.mean(rwds_i_norm_scaled)):.3f}, max={float(np.max(rwds_i_norm_scaled)):.3f}, sum={float(np.sum(rwds_i_norm_scaled)):.1f}")
-        print(f"Extrinsic scaled: μ={float(np.mean(rwds_e_norm_scaled)):.3f}, max={float(np.max(rwds_e_norm_scaled)):.3f}, sum={float(np.sum(rwds_e_norm_scaled)):.1f}")
+        # Intrinsic normalized stats (across all transitions)
+        rwds_i_norm_all = [ri / (std_i_running if std_i_running > 0 else 1.0) for ri in flat_rwds_i_raw]
+        if len(rwds_i_norm_all) > 0:
+            print(f"Intrinsic scaled: μ={float(np.mean(rwds_i_norm_all)):.3f}, max={float(np.max(rwds_i_norm_all)):.3f}, sum={float(np.sum(rwds_i_norm_all)):.1f}")
+        print(f"Extrinsic raw: μ={batch_mean_e}")
         os.makedirs(f'{debug_dir}/checkpoints', exist_ok=True)
         if (iter_idx + 1) % 25 == 0:
             checkpoint = {

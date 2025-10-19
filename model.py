@@ -4,39 +4,173 @@ import torch.nn.functional as F
 import numpy as np
 import math
 import random
-import threading
-import time
+
+from typing import Optional, Tuple
 
 OBS_HEIGHT = 80
 OBS_WIDTH = 60
 OBS_CHANNELS = 4
 OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
 
+def mlp(input_dim, hidden_sizes=(128, 128), activation=nn.ReLU):
+    """Create a multi-layer perceptron."""
+    layers = []
+    prev_size = input_dim
+    for hidden_size in hidden_sizes:
+        layers.append(nn.Linear(prev_size, hidden_size))
+        layers.append(activation())
+        prev_size = hidden_size
+    return nn.Sequential(*layers)
+
+class RNDModule(nn.Module):
+    def __init__(self, in_dim, feat_dim=128, hidden=(128, 128)):
+        super().__init__()
+        self.target = mlp(in_dim, hidden_sizes=hidden)
+        self.predictor = mlp(in_dim, hidden_sizes=hidden)
+        self.target_last = nn.Linear(hidden[-1] if hidden else in_dim, feat_dim)
+        self.predictor_last = nn.Linear(hidden[-1] if hidden else in_dim, feat_dim)
+
+        for p in self.target.parameters():
+            p.requires_grad = False
+        for p in self.target_last.parameters():
+            p.requires_grad = False
+    
+    def forward(self, obs):
+        target = self.target(obs)
+        predictor = self.predictor(obs)
+        target_last = self.target_last(target)
+        predictor_last = self.predictor_last(predictor)
+        return predictor_last, target_last  
+    
+    def intrinsic_reward(self, obs):
+        with torch.no_grad():
+            pfeat, tfeat = self.forward(obs)
+            mse = torch.mean((pfeat - tfeat) ** 2, dim=-1)
+            return mse
+        
+    def predictor_loss(self, obs):
+        pfeat, tfeat = self.forward(obs)
+        loss = torch.mean((pfeat - tfeat) ** 2)
+        return loss
+
+class RNDAgent(nn.Module):
+    '''
+    Actor-critic policy with:
+    - shared body (MLP)
+    - action head 
+    - intrinsic value head
+    - extrinsic value head
+    - integrated RND module for intrinsic reward
+    '''
+    def __init__(self, obs_dim, n_actions, hidden=(256,256), rnd_feat_dim=128):
+        super().__init__()
+        self.backbone = mlp(obs_dim, hidden_sizes=hidden)
+        last_hidden = hidden[-1] if len(hidden) else obs_dim
+        self.action_head = nn.Linear(last_hidden, n_actions)
+        self.v_int_head = nn.Linear(last_hidden, 1)
+        self.v_ext_head = nn.Linear(last_hidden, 1)
+        self.rnd = RNDModule(obs_dim, feat_dim=rnd_feat_dim, hidden=(128,))
+
+    def forward(self, obs):
+        x = self.backbone(obs)
+        logits = self.action_head(x)
+        v_int = self.v_int_head(x).squeeze(-1)
+        v_ext = self.v_ext_head(x).squeeze(-1)
+        return logits, v_int, v_ext
+    
+    def step(self, obs):
+        logits, v_int, v_ext = self.forward(obs)
+        dist = torch.distributions.Categorical(logits=logits)
+        action = dist.sample()
+        logp = dist.log_prob(action)
+        return action.item(), logits, logp.item(), v_int.item(), v_ext.item()
+
 # ============================================================================
 # Statistics Tracking
 # ============================================================================
-class RunningStats():
-    def __init__(self, eps=1e-4):
-        self.mean = 0
-        self.count = eps
-        self.M2 = 0.0
-        self.lock = threading.Lock()
+# from https://github.com/copilot/c/6272f7e5-79a1-4f6b-89a0-f3cb8d1b15d2
+class RunningStats:
+    def __init__(self, eps: float = 1e-4, shape: Tuple[int, ...] = (), device: Optional[torch.device] = None, dtype: torch.dtype = torch.float64):
+        """
+        eps: small initial count to avoid division by zero (matches TF code default)
+        shape: shape of an individual sample (e.g., observation shape). Use () for scalars.
+        device: torch.device or None (None => cpu)
+        dtype: internal dtype (float64 recommended for stability)
+        """
+        if device is None:
+            device = torch.device('cpu')
+        self.device = torch.device(device)
+        self.dtype = dtype
 
-    # input is vectorized adv, rwd, obs
-    def update(self, x):
-        with self.lock:
-            self.count += 1
-            delta = x - self.mean
-            self.mean += delta / self.count
-            delta2 = x - self.mean
-            self.M2 += delta * delta2
+        # population mean & variance, stored as tensors
+        self.mean = torch.zeros(shape, dtype=self.dtype, device=self.device)
+        self.var = torch.ones(shape, dtype=self.dtype, device=self.device)  # population variance
+        self.count = float(eps)  # acts like "n" from the TF RunningMeanStd
+
+    def update(self, x: torch.Tensor):
+        """
+        Update running mean/var with a batch of samples.
+
+        x: torch.Tensor with shape (batch, *sample_shape) OR a single sample of shape sample_shape.
+           Leading dimension is treated as batch dimension.
+           Will be converted to the class' dtype & device.
+
+        Behaviour:
+         - If x has the same ndim as the stored mean (i.e. a single sample), it will be unsqueezed into a batch of size 1.
+         - Uses numerically-stable merging formula for mean and variance (population var).
+        """
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("x must be a torch.Tensor")
+
+        # bring to internal dtype and device
+        if x.dtype != self.dtype:
+            x = x.to(dtype=self.dtype)
+        if x.device != self.device:
+            x = x.to(self.device)
+
+        # If user passed single sample (no leading batch dim), add batch dim
+        if x.ndim == self.mean.ndim:
+            x = x.unsqueeze(0)  # shape becomes (1, *sample_shape)
+
+        batch_count = float(x.shape[0])
+        if batch_count == 0.0:
+            return
+
+        # compute batch statistics (population variance, unbiased=False)
+        batch_mean = torch.mean(x, dim=0)
+        batch_var = torch.var(x, dim=0, unbiased=False)  # population var over the batch
+
+        # merge current stats with batch stats
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        # new mean
+        new_mean = self.mean + delta * (batch_count / tot_count)
+
+        # compute combined M2 (sum of squared deviations)
+        m_a = self.var * self.count  # var is population var, so multiply by count
+        m_b = batch_var * batch_count
+        # the cross term
+        cross = (delta * delta) * (self.count * batch_count / tot_count)
+
+        M2 = m_a + m_b + cross
+        new_var = M2 / tot_count  # population variance
+
+        # commit updates
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
 
     def get(self):
-        with self.lock:
-            if self.count < 2:
-                return self.count, self.mean, float('nan')
-            var = self.M2 / (self.count - 1)  # sample variance
-            return self.count, self.mean, math.sqrt(var)
+        """
+        Returns a tuple (count, mean, std).
+        - If the tracked shape is scalar (), mean and std are returned as Python floats.
+        - Otherwise, mean and std are returned as torch.Tensors on the internal device/dtype.
+        """
+        std = torch.sqrt(self.var + torch.finfo(self.var.dtype).eps)
+        if self.mean.numel() == 1:
+            return (self.count, float(self.mean.item()), float(std.item()))
+        return (self.count, self.mean.clone(), std.clone())
 
 class EpisodicNoveltyBuffer:
     """Lightweight episodic novelty tracker using cosine similarity in embedding space."""
@@ -77,7 +211,6 @@ class EpisodicNoveltyBuffer:
         else:
             tensor = torch.zeros_like(tensor)
         return tensor
-
 
 # ============================================================================
 # Neural Network Components
