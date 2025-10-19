@@ -29,8 +29,8 @@ ITERS = 1000
 EPOCHS = 3  
 FRAME_SKIP = 4
 FRAME_STACK = 4  # Stack last 4 frames as in the paper
-MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(4e4)  # Reduced to avoid OOM
-MAX_FRAMES_PER_EPISODE = int(37.5*60*3)  # Per-thread 1 minute episode limit
+MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(1e4)  # Reduced to avoid OOM
+MAX_FRAMES_PER_EPISODE = int(37.5*60*1)  # Per-thread 1 minute episode limit
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
 GAE_LAMBDA = 0.95
@@ -150,7 +150,7 @@ def stack_frames(frame_buffer, new_frame):
         frame_buffer = frame_buffer[1:] + [gray_frame]  # Shift and append
         return frame_buffer
        
-def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter,
+def run_episode(thread_id, agent, fwd_model, err_model, enc_model, buffer, stats, frame_counter,
                 error_ready, save_rgb_debug, device='cpu'):
     game = vzd.DoomGame()
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -159,12 +159,12 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
     game.set_doom_map("E1M1")
     game.set_render_hud(False)
     #game.set_hit_reward(1.0) #hitting barrels also give reward, so disable this
-    game.set_death_reward(-1.0)
-    game.set_kill_reward(1.0)
+    game.set_death_reward(-0.5)
+    game.set_kill_reward(10.0)
     game.set_armor_reward(0.0)
     game.set_health_reward(0.0)
-    game.set_map_exit_reward(10.0)
-    game.set_secret_reward(5.0)
+    game.set_map_exit_reward(100.0)
+    game.set_secret_reward(50.0)
     game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
     game.set_window_visible(False)
     game.set_mode(vzd.Mode.PLAYER)
@@ -214,7 +214,7 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
 
         with torch.no_grad():
             obs_stack_tensor = torch.tensor(obs_stacked_np, dtype=torch.float32, device=device).unsqueeze(0)
-            phi_t = encoder_model(obs_stack_tensor)
+            phi_t = enc_model(obs_stack_tensor)
 
         novelty_counter += 1
         if novelty_counter >= SKIP_FRAMES_NOVELTY:
@@ -231,8 +231,8 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
             episodic_novelty = last_novelty
 
         with torch.no_grad():
-            pred_next = dynamics_model(phi_t, act_onehot)
-            expected_error_log = error_model(phi_t, act_onehot).item()
+            pred_phi_t_next = fwd_model(phi_t, act_onehot)
+            expected_error_log = err_model(phi_t, act_onehot).item()
 
         action_buttons = MACRO_ACTIONS[act_idx_item]
         action_vector = [btn in action_buttons for btn in BUTTONS_ORDER]
@@ -248,10 +248,10 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
             obs_next_stacked_np = np.stack(frame_buffer_next, axis=0)  # (4, H, W) grayscale
 
             with torch.no_grad():
-                obs_next_t = torch.tensor(obs_next_stacked_np, dtype=torch.float32, device=device).unsqueeze(0)
-                phi_next_t = encoder_model(obs_next_t)
+                obs_t_next = torch.tensor(obs_next_stacked_np, dtype=torch.float32, device=device).unsqueeze(0)
+                phi_t_next = enc_model(obs_t_next)
 
-                mse = F.mse_loss(pred_next, phi_next_t, reduction='none')
+                mse = F.mse_loss(pred_phi_t_next, phi_t_next, reduction='none')
             mse_flat = mse.view(mse.shape[0], -1).mean(dim=1)
             epsilon = math.log(max(mse_flat.item(), EPSILON_CLAMP))
         else:
@@ -282,12 +282,15 @@ def run_episode(thread_id, agent, dynamics_model, error_model, encoder_model, bu
         frames_collected += FRAME_SKIP
 
         # Update running rewards for stats
+        '''
         run_rwd_i = run_rwd_i * GAMMA_INT + rwd_i
         run_rwd_e = run_rwd_e * GAMMA_EXT + rwd_e
 
-    intrinsic_stats, extrinsic_stats = stats
-    intrinsic_stats.update(run_rwd_i)
-    extrinsic_stats.update(run_rwd_e)
+        intrinsic_stats, extrinsic_stats = stats
+        if run_rwd_i != 0:
+            intrinsic_stats.update(run_rwd_i)
+        extrinsic_stats.update(run_rwd_e)
+        '''
 
     with frame_counter:
         frame_counter.count += len(obss) * FRAME_SKIP
@@ -316,14 +319,14 @@ class FrameCounter:
         with self.lock:
             self.count = 0
 
-def run_parallel_episodes(n_threads, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter,
+def run_parallel_episodes(n_threads, agent, fwd_model, err_model, enc_model, buffer, stats, frame_counter,
                          error_ready, debug_thread_id, device='cpu'):
     threads = []
     for tid in range(n_threads):
         save_rgb = (tid == debug_thread_id)  # Only one thread saves RGB
         t = threading.Thread(
             target=run_episode,
-            args=(tid, agent, dynamics_model, error_model, encoder_model, buffer, stats, frame_counter,
+            args=(tid, agent, fwd_model, err_model, enc_model, buffer, stats, frame_counter,
                   error_ready, save_rgb, device)
         )
         t.start()
@@ -410,13 +413,13 @@ if __name__ == '__main__':
 
     n_actions = len(MACRO_ACTIONS)
     agent = Agent(n_actions).to(device)
-    dynamics_model = LPMDynamicsModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
-    error_model = LPMErrorModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
-    encoder_model = RandomEncoder(out_dim=ENCODER_FEATS, in_ch=FRAME_STACK).to(device)
+    fwd_model = LPMDynamicsModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
+    err_model = LPMErrorModel(n_actions, feat_dim=ENCODER_FEATS, hidden=LPM_HIDDEN).to(device)
+    enc_model = RandomEncoder(out_dim=ENCODER_FEATS, in_ch=FRAME_STACK).to(device)
 
     agent_optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
-    dynamics_optimizer = torch.optim.Adam(dynamics_model.parameters(), lr=DYNAMICS_LEARNING_RATE)
-    error_optimizer = torch.optim.Adam(error_model.parameters(), lr=ERROR_LEARNING_RATE)
+    dynamics_optimizer = torch.optim.Adam(fwd_model.parameters(), lr=DYNAMICS_LEARNING_RATE)
+    error_optimizer = torch.optim.Adam(err_model.parameters(), lr=ERROR_LEARNING_RATE)
 
     dynamics_buffer = DynamicsReplayBuffer(DYNAMICS_REPLAY_SIZE)
     error_buffer = ErrorReplayBuffer(ERROR_BUFFER_SIZE)
@@ -439,13 +442,13 @@ if __name__ == '__main__':
         total_episodes = 0
         episodes_data = []
 
-        dynamics_model.eval()
-        error_model.eval()
-        encoder_model.eval()
+        fwd_model.eval()
+        err_model.eval()
+        enc_model.eval()
 
         while frame_counter.get() < MAX_ROLLOUT_FRAMES:
             run_parallel_episodes(
-                n_threads, agent, dynamics_model, error_model, encoder_model,
+                n_threads, agent, fwd_model, err_model, enc_model,
                 buffer, stats, frame_counter, error_ready, debug_thread_id, device
             )
 
@@ -510,27 +513,31 @@ if __name__ == '__main__':
                     "dones": dones_ep,
                     "next_val": next_val,
                 })
+
+                rwd_i_rms.update(sum(rwds_i)/len(rwds_i))
+                rwd_e_rms.update(sum(rwds_e)/len(rwds_e))
+
                 all_rwds_i_raw.extend(rwds_i)
                 all_rwds_e_raw.extend(rwds_e)
 
                 del ep, obss, obss_next, obss_rgb, obss_next_rgb
 
-        dynamics_model.train()
-        error_model.train()
+        fwd_model.train()
+        err_model.train()
         print(f"Collected {total_episodes} episodes, {frame_counter.get()} frames")
 
         _, _, rwd_i_std = rwd_i_rms.get()
         _, _, rwd_e_std = rwd_e_rms.get()
 
         intrinsic_scale = max(float(rwd_i_std), 1e-3) if all_rwds_i_raw else 1.0
-        extrinsic_scale = max(float(rwd_e_std), 1e-3) if all_rwds_e_raw else 1.0
+        extrinsic_scale = 1.0 #max(float(rwd_e_std), 1e-1) if all_rwds_e_raw else 1.0
 
         rwds_e_norm_scaled = []
         rwds_i_norm_scaled = []
 
         for episode in episodes_data:
-            rwds_i_norm = episode["rwds_i"] / intrinsic_scale
             rwds_e_norm = episode["rwds_e"] / extrinsic_scale
+            rwds_i_norm = torch.clamp(episode["rwds_i"] / intrinsic_scale, max=1.0)
             total_rwds_ep = EXTRINSIC_COEF * rwds_e_norm + INTRINSIC_COEF * rwds_i_norm
 
             advs_ep, rets_ep = compute_gae(
@@ -542,8 +549,8 @@ if __name__ == '__main__':
                 GAE_LAMBDA
             )
 
-            rwds_e_norm_scaled.append(rwds_e_norm)
-            rwds_i_norm_scaled.append(rwds_i_norm)
+            rwds_e_norm_scaled.append(rwds_e_norm * EXTRINSIC_COEF)
+            rwds_i_norm_scaled.append(rwds_i_norm * INTRINSIC_COEF)
 
             all_obs.append(episode["obs"])
             all_obs_next.append(episode["obs_next"])
@@ -557,7 +564,7 @@ if __name__ == '__main__':
             all_learning_progress.append(episode["learning_progress"])
 
         obs_t = torch.cat(all_obs, dim=0)
-        obs_next_t = torch.cat(all_obs_next, dim=0)
+        obs_t_next = torch.cat(all_obs_next, dim=0)
         acts_t = torch.cat(all_acts, dim=0)
         logps_t = torch.cat(all_logps, dim=0)
         advantages = torch.cat(all_advantages, dim=0)
@@ -567,8 +574,10 @@ if __name__ == '__main__':
         novelty_t = torch.cat(all_novelties, dim=0) if all_novelties else torch.empty(0, dtype=torch.float32)
         learning_progress_t = torch.cat(all_learning_progress, dim=0) if all_learning_progress else torch.empty(0, dtype=torch.float32)
 
-        dynamics_buffer.extend(obs_t.cpu().numpy(),acts_t.cpu().numpy(),obs_next_t.cpu().numpy())
+        dynamics_buffer.extend(obs_t.cpu().numpy(),acts_t.cpu().numpy(),obs_t_next.cpu().numpy())
         error_buffer.extend(obs_t.cpu().numpy(), acts_t.cpu().numpy(), eps_t.cpu().numpy())
+
+        if iter_idx == 0: error_buffer.commit_pending()
 
         n_samples = len(obs_t)
         indices = np.arange(n_samples)
@@ -600,21 +609,21 @@ if __name__ == '__main__':
             for _ in range(DYNAMICS_GRAD_STEPS):
                 if len(dynamics_buffer) < DYNAMICS_BATCH_SIZE:
                     break
-                obs_b, act_b, next_obs_b = dynamics_buffer.sample(DYNAMICS_BATCH_SIZE)
+                obs_b, act_b, obs_b_next = dynamics_buffer.sample(DYNAMICS_BATCH_SIZE)
                 obs_b = obs_b.to(device)
-                next_obs_b = next_obs_b.to(device)
+                obs_b_next = obs_b_next.to(device)
                 act_onehot = F.one_hot(act_b.to(device), n_actions).float()
 
                 with torch.no_grad():
-                    phi_obs = encoder_model(obs_b)
-                    phi_next = encoder_model(next_obs_b)
+                    phi_obs = enc_model(obs_b)
+                    phit_t_next = enc_model(obs_b_next)
 
-                pred_next = dynamics_model(phi_obs, act_onehot)
-                dyn_loss = F.mse_loss(pred_next, phi_next)
+                pred_phi_t_next = fwd_model(phi_obs, act_onehot)
+                dyn_loss = F.mse_loss(pred_phi_t_next, phit_t_next)
 
                 dynamics_optimizer.zero_grad(set_to_none=True)
                 dyn_loss.backward()
-                nn.utils.clip_grad_norm_(dynamics_model.parameters(), MAX_GRAD_NORM)
+                nn.utils.clip_grad_norm_(fwd_model.parameters(), MAX_GRAD_NORM)
                 dynamics_optimizer.step()
 
                 total_dynamics_loss += dyn_loss.item()
@@ -630,14 +639,14 @@ if __name__ == '__main__':
                 eps_b_log = eps_b_log.to(device)
 
                 with torch.no_grad():
-                    phi_obs = encoder_model(obs_b)
+                    phi_obs = enc_model(obs_b)
 
-                eps_pred = error_model(phi_obs, act_onehot)
+                eps_pred = err_model(phi_obs, act_onehot)
                 err_loss = F.mse_loss(eps_pred, eps_b_log)
 
                 error_optimizer.zero_grad(set_to_none=True)
                 err_loss.backward()
-                nn.utils.clip_grad_norm_(error_model.parameters(), MAX_GRAD_NORM)
+                nn.utils.clip_grad_norm_(err_model.parameters(), MAX_GRAD_NORM)
                 error_optimizer.step()
 
                 error_loss_total += err_loss.item()
@@ -659,8 +668,11 @@ if __name__ == '__main__':
         error_actual_mean = eps_actual_total / max(error_updates, 1) if error_updates else 0.0
 
         iter_time = time.time() - iter_start
+        # TODO REMOVE set to 1.0 for debug
         _, mean_i_running, std_i_running = rwd_i_rms.get()
         _, mean_e_running, std_e_running = rwd_e_rms.get()
+        #std_i_running = 1.0
+        std_e_running = 1.0
 
         batch_mean_i = np.mean(all_rwds_i_raw) if all_rwds_i_raw else 0.0
         batch_std_i = np.std(all_rwds_i_raw) if all_rwds_i_raw else 0.0
@@ -701,7 +713,7 @@ if __name__ == '__main__':
             "loss/value": v_loss,
             "loss/entropy": -ent_loss,
             "loss/dynamics": dynamics_loss,
-            "loss/error_model": error_loss_mean,
+            "loss/err_model": error_loss_mean,
             "reward/intrinsic_running": mean_i_running,
             "reward/extrinsic_running": mean_e_running,
             "reward/learning_progress_std": learning_progress_std,
@@ -747,16 +759,16 @@ if __name__ == '__main__':
         print("Iteration Rollout Rewards:")
         print(f"Intrinsic raw: μ={batch_mean_i:.6f}, σ={batch_std_i:.6f}, max={batch_max_i:.6f}")
         print(f"Extrinsic raw: μ={batch_mean_e:.3f}, max={batch_max_e:.3f}, sum={batch_sum_e:.1f}")
-        print(f"Extrinsic scaled: μ={float(np.mean(rwds_e_norm_scaled)):.3f}, max={float(np.max(rwds_e_norm_scaled)):.3f}, sum={float(np.sum(rwds_e_norm_scaled)):.1f}")
         print(f"Intrinsic scaled: μ={float(np.mean(rwds_i_norm_scaled)):.3f}, max={float(np.max(rwds_i_norm_scaled)):.3f}, sum={float(np.sum(rwds_i_norm_scaled)):.1f}")
+        print(f"Extrinsic scaled: μ={float(np.mean(rwds_e_norm_scaled)):.3f}, max={float(np.max(rwds_e_norm_scaled)):.3f}, sum={float(np.sum(rwds_e_norm_scaled)):.1f}")
         if INTRINSIC_ONLY: print("Note: Training with INTRINSIC_ONLY (extrinsic not used for learning)")
         os.makedirs(f'{debug_dir}/checkpoints', exist_ok=True)
         if (iter_idx + 1) % 25 == 0:
             checkpoint = {
                 'iteration': iter_idx + 1,
                 'agent_state_dict': agent.state_dict(),
-                'dynamics_state_dict': dynamics_model.state_dict(),
-                'error_state_dict': error_model.state_dict(),
+                'dynamics_state_dict': fwd_model.state_dict(),
+                'error_state_dict': err_model.state_dict(),
                 'agent_optimizer': agent_optimizer.state_dict(),
                 'dynamics_optimizer': dynamics_optimizer.state_dict(),
                 'error_optimizer': error_optimizer.state_dict(),

@@ -37,26 +37,6 @@ class RunningStats():
             var = self.M2 / (self.count - 1)  # sample variance
             return self.count, self.mean, math.sqrt(var)
 
-class RewardRMS:
-    """Tracks running root-mean-square for per-step rewards."""
-    def __init__(self, eps=1e-8):
-        self.mean2 = eps
-        self.count = eps
-
-    def update(self, x):
-        """x: tensor or array of per-step rewards."""
-        if isinstance(x, torch.Tensor):
-            tensor = x
-        else:
-            tensor = torch.tensor(x, dtype=torch.float32)
-        if tensor.numel() == 0:
-            return
-        self.count += tensor.numel()
-        self.mean2 += (tensor.float() ** 2).sum().item()
-
-    def std(self):
-        return math.sqrt(self.mean2 / self.count)
-
 class EpisodicNoveltyBuffer:
     """Lightweight episodic novelty tracker using cosine similarity in embedding space."""
     def __init__(self, embedding_dim, similarity_threshold=0.9, device='cpu'):

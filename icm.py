@@ -171,7 +171,7 @@ class Agent(nn.Module):
         return log_probs, entropy, values
 
 # Random encoder sufficient for encoding states, from https://arxiv.org/pdf/1808.04355
-# Use RandomEncoder when computing phi_st_next, phi_st
+# Use RandomEncoder when computing phi_tt_next, phi_tt
 class RandomEncoder(nn.Module):
     def __init__(self, in_ch=4, out_dim=512):  # 4 channels for frame stack
         super().__init__()
@@ -221,8 +221,8 @@ class InverseDynamicsModel(nn.Module):
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, n_actions)
 
-    def forward(self, phi_s, phi_s_next):
-        z = torch.cat([phi_s, phi_s_next], dim=-1)
+    def forward(self, phi_t, phi_t_next):
+        z = torch.cat([phi_t, phi_t_next], dim=-1)
         z = F.relu(self.fc1(z))
         z = F.relu(self.fc2(z))
         return self.fc3(z)  # Logits for action prediction
@@ -238,8 +238,8 @@ class ForwardDynamicsModel(nn.Module):
         self.blocks = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(FWD_LAYERS)])
         self.fc_head = nn.Linear(hidden, feat_dim)
 
-    def forward(self, phi_s, a_onehot):
-        z = torch.cat([phi_s, a_onehot], dim=-1)
+    def forward(self, phi_t, a_onehot):
+        z = torch.cat([phi_t, a_onehot], dim=-1)
         z = F.relu(self.fc1(z))
         for block in self.blocks:
             z = F.relu(block(z))
@@ -261,12 +261,12 @@ class ForwardDynamicsModel(nn.Module):
         self.fc3 = nn.Linear(hidden, hidden)
         self.fc4 = nn.Linear(hidden, feat_dim)
         
-    def forward(self, phi_s, a_onehot):
-        batch_size = phi_s.shape[0]
-        device = phi_s.device
+    def forward(self, phi_t, a_onehot):
+        batch_size = phi_t.shape[0]
+        device = phi_t.device
         
         # Process current state-action pair
-        z = torch.cat([phi_s, a_onehot], dim=-1)
+        z = torch.cat([phi_t, a_onehot], dim=-1)
         z = F.relu(self.fc1(z))
         
         # Pass through GRU to get temporal context
@@ -443,8 +443,8 @@ def run_episode(thread_id, agent, fwd_model, phi_enc, buffer, stats, frame_count
         # Compute predicted next state features for intrinsic reward
         # Use full frame stack for phi encoding
         with torch.no_grad():
-            phi_s = phi_enc(obs_t)
-            phi_hat = fwd_model(phi_s, act_onehot.unsqueeze(0))
+            phi_t = phi_enc(obs_t)
+            phi_hat = fwd_model(phi_t, act_onehot.unsqueeze(0))
 
         # Take action using macro action
         action_buttons = MACRO_ACTIONS[act_idx_item]
@@ -464,8 +464,8 @@ def run_episode(thread_id, agent, fwd_model, phi_enc, buffer, stats, frame_count
             # Compute intrinsic reward using full frame stack
             with torch.no_grad():
                 obs_next_t = torch.tensor(obs_next_stacked, dtype=torch.float32, device=device).unsqueeze(0)
-                phi_s_next = phi_enc(obs_next_t)
-                rwd_i = F.mse_loss(phi_hat, phi_s_next, reduction='none').mean().item()
+                phi_t_next = phi_enc(obs_next_t)
+                rwd_i = F.mse_loss(phi_hat, phi_t_next, reduction='none').mean().item()
         else:
             obs_next_stacked = np.zeros_like(obs_stacked)  # Placeholder
             raw_frame_next_hwc = np.zeros((obs_stacked.shape[1], obs_stacked.shape[2], 3), dtype=np.uint8)
@@ -828,8 +828,8 @@ if __name__ == '__main__':
                 mb_acts = acts_t[mb_idx].to(device)
 
                 # Encode features
-                phi_s = phi_enc(mb_obs_stack)
-                phi_s_next = phi_enc(mb_obs_next_stack)
+                phi_t = phi_enc(mb_obs_stack)
+                phi_t_next = phi_enc(mb_obs_next_stack)
 
                 # Compute both forward and inverse losses first, then update models
                 # This prevents double-backpropagation through the same computational graph
@@ -837,8 +837,8 @@ if __name__ == '__main__':
                 act_onehot = F.one_hot(mb_acts, n_actions).float()
 
                 # Forward dynamics loss (train forward model to predict next features)
-                phi_pred = fwd_model(phi_s.detach(), act_onehot)
-                per_sample_fwd = F.mse_loss(phi_pred, phi_s_next.detach(), reduction='none').mean(dim=1)
+                phi_pred = fwd_model(phi_t.detach(), act_onehot)
+                per_sample_fwd = F.mse_loss(phi_pred, phi_t_next.detach(), reduction='none').mean(dim=1)
                 if IGNORE_DONES:
                     fwd_loss_val = per_sample_fwd.mean()
                 else:
@@ -848,11 +848,11 @@ if __name__ == '__main__':
                 idm_loss = 0.0
                 if USE_INVERSE_DYNAMICS:
                     # Recompute features for inverse dynamics to ensure fresh graph
-                    phi_s_idm = phi_enc(mb_obs_stack)
-                    phi_s_next_idm = phi_enc(mb_obs_next_stack)
+                    phi_idm_t = phi_enc(mb_obs_stack)
+                    phi_idm_t_next = phi_enc(mb_obs_next_stack)
 
-                    # Predict action from (phi_s, phi_s_next)
-                    action_logits = idm_model(phi_s_idm, phi_s_next_idm)
+                    # Predict action from (phi_t, phi_t_next)
+                    action_logits = idm_model(phi_idm_t, phi_idm_t_next)
                     idm_loss_val = F.cross_entropy(action_logits, mb_acts, reduction='none')
                     if IGNORE_DONES:
                         idm_loss_val = idm_loss_val.mean()
@@ -860,8 +860,8 @@ if __name__ == '__main__':
                         idm_loss_val = (idm_loss_val * mb_not_terminal).sum() / (mb_not_terminal.sum().clamp_min(1))
 
                     # Forward dynamics loss for encoder (part of joint optimization)
-                    phi_pred_enc = fwd_model(phi_s_idm, act_onehot)
-                    per_sample_fwd_enc = F.mse_loss(phi_pred_enc, phi_s_next_idm.detach(), reduction='none').mean(dim=1)
+                    phi_pred_enc = fwd_model(phi_idm_t, act_onehot)
+                    per_sample_fwd_enc = F.mse_loss(phi_pred_enc, phi_idm_t_next.detach(), reduction='none').mean(dim=1)
                     if IGNORE_DONES:
                         fwd_loss_enc = per_sample_fwd_enc.mean()
                     else:
