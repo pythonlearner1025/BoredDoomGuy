@@ -199,7 +199,7 @@ def run_parallel_episodes(n_procs, agent_state_dict, buffer, frame_counter, debu
 
 def ppo_update(agent, optimizer, obs_mb, act_mb, old_logp_mb, adv_mb, ret_int_mb, ret_ext_mb, clip_coef=CLIP_COEF, ent_coef=0.01, vf_coef=VF_COEF):
     adv_mb = (adv_mb - adv_mb.mean()) / (adv_mb.std() + 1e-8)
-    logits, v_int_new, v_ext_new = agent.forward(obs_policy_mb)
+    logits, v_int_new, v_ext_new = agent.forward(obs_mb)
     dist = torch.distributions.Categorical(logits=logits)
     logp_new_mb, entropy, ratio = dist.log_prob(act_mb), dist.entropy().mean(), (dist.log_prob(act_mb) - old_logp_mb).exp()
 
