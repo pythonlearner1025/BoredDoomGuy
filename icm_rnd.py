@@ -22,13 +22,13 @@ ENT_COEF_START, ENT_COEF_END = 0.10, 0.001
 MINIBATCH_SIZE, LEARNING_RATE = 2048, 1e-4
 GAMMA_INT, GAMMA_EXT, GAE_LAMBDA = 0.99, 0.999, 0.95
 INTRINSIC_COEF, EXTRINSIC_COEF = 0.8, 0.2
+IGNORE_DONES = True
 
 OBS_HEIGHT, OBS_WIDTH = 60, 80
 OBS_CHANNELS = FRAME_STACK
 OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
 OBS_RANDOM_WARMUP_STEPS = 10000
-OBS_CLIP_MIN = -5.0
-OBS_CLIP_MAX = 5.0
+OBS_CLIP_MIN, OBS_CLIP_MAX = -5.0, 5.0
 
 MACRO_ACTIONS = [
     [], [vzd.Button.MOVE_FORWARD], [vzd.Button.MOVE_BACKWARD],
@@ -68,7 +68,31 @@ def resize_gray_frame(gray_frame):
 def stack_frames(frame_buffer, new_frame):
     gray_frame = resize_gray_frame(rgb_to_grayscale(new_frame))
     return [gray_frame] * FRAME_STACK if not frame_buffer else frame_buffer[1:] + [gray_frame]
-       
+
+class RandomAgent:
+    def __init__(self, n_actions):
+        self.n_actions = n_actions
+    def act(self):
+        return random.randint(0, self.n_actions - 1)
+
+def warmup_observation_stats(ob_rms):
+    game = setup_game()
+    game.new_episode()
+    rand_agent = RandomAgent(len(MACRO_ACTIONS))
+    device = ob_rms.mean.device if hasattr(ob_rms.mean, 'device') else torch.device('cpu')
+    
+    for _ in range(OBS_RANDOM_WARMUP_STEPS):
+        if game.is_episode_finished():
+            game.new_episode()
+        state = game.get_state()
+        if not state:
+            continue
+        gray = resize_gray_frame(rgb_to_grayscale(state.screen_buffer))
+        ob_rms.update(torch.tensor((gray.astype(np.float32) / 255.0)[..., None], dtype=torch.float32, device=device))
+        action_vector = [btn in MACRO_ACTIONS[rand_agent.act()] for btn in BUTTONS_ORDER]
+        game.make_action(action_vector, FRAME_SKIP)
+    game.close()
+
 def setup_game():
     game = vzd.DoomGame()
     wad_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Doom1.WAD")
@@ -197,15 +221,15 @@ def run_parallel_episodes(n_procs, agent_state_dict, buffer, frame_counter, debu
     for p in processes:
         p.join()
 
-def ppo_update(agent, optimizer, obs_mb, act_mb, old_logp_mb, adv_mb, ret_int_mb, ret_ext_mb, clip_coef=CLIP_COEF, ent_coef=0.01, vf_coef=VF_COEF):
+def ppo_update(agent, optimizer, obs_policy_mb, obs_rnd_mb, act_mb, old_logp_mb, adv_mb, ret_int_mb, ret_ext_mb, clip_coef=CLIP_COEF, ent_coef=0.01, vf_coef=VF_COEF):
     adv_mb = (adv_mb - adv_mb.mean()) / (adv_mb.std() + 1e-8)
-    logits, v_int_new, v_ext_new = agent.forward(obs_mb)
+    logits, v_int_new, v_ext_new = agent.forward(obs_policy_mb)
     dist = torch.distributions.Categorical(logits=logits)
     logp_new_mb, entropy, ratio = dist.log_prob(act_mb), dist.entropy().mean(), (dist.log_prob(act_mb) - old_logp_mb).exp()
 
     pi_loss = -torch.min(ratio * adv_mb, torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_mb).mean()
     v_loss_int, v_loss_ext = 0.5 * F.mse_loss(v_int_new, ret_int_mb), 0.5 * F.mse_loss(v_ext_new, ret_ext_mb)
-    rnd_loss = agent.rnd.predictor_loss(obs_mb).mean()
+    rnd_loss = agent.rnd.predictor_loss(obs_rnd_mb).mean()
 
     total_loss = pi_loss + vf_coef * (v_loss_int + v_loss_ext) - ent_coef * entropy + rnd_loss
     optimizer.zero_grad()
@@ -214,11 +238,11 @@ def ppo_update(agent, optimizer, obs_mb, act_mb, old_logp_mb, adv_mb, ret_int_mb
     optimizer.step()
     return pi_loss.item(), (v_loss_int + v_loss_ext).item(), v_loss_int.item(), v_loss_ext.item(), -entropy.item(), rnd_loss.item()
 
-def compute_gae_1d(rewards, values, dones, gamma, gae_lambda):
+def compute_gae_1d(rewards, values, dones, gamma, gae_lambda, ignore_dones=False):
     T, device = rewards.shape[0], rewards.device
     advantages, lastgaelam = torch.zeros(T, dtype=torch.float32, device=device), 0.0
     for t in reversed(range(T)):
-        nextnonterminal = 0.0 if (dones[t if t == T - 1 else t+1].float() > 0.5) else 1.0
+        nextnonterminal = 1.0 if ignore_dones else (0.0 if (dones[t if t == T - 1 else t+1].float() > 0.5) else 1.0)
         nextvalues = torch.tensor(0.0, dtype=torch.float32, device=device) if t == T - 1 else values[t+1]
         delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
         lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
@@ -367,22 +391,14 @@ if __name__ == '__main__':
             T = obss_ep.shape[0]
             if T == 0:
                 continue
-            # Build two views of observations:
-            # - Policy/value: scaled to [0,1] only (no whitening)
-            # - RND: whitened using running stats and clipped to [-5, 5]
             obs_img = (obss_ep.astype(np.float32) / 255.0)
             obs_policy_ep = torch.tensor(obs_img, dtype=torch.float32)
 
             _, mean_hw1, std_hw1 = ob_rms.get()
-            mean_hw1_t = mean_hw1 if isinstance(mean_hw1, torch.Tensor) else torch.tensor(mean_hw1, device=device)
-            std_hw1_t = std_hw1 if isinstance(std_hw1, torch.Tensor) else torch.tensor(std_hw1, device=device)
-            mean_hw1_t = mean_hw1_t.to(dtype=torch.float32, device=device)
-            std_hw1_t = torch.clamp(torch.as_tensor(std_hw1_t, dtype=torch.float32, device=device), min=1e-6)
-            mean_hw = mean_hw1_t[..., 0]  # (H,W)
-            std_hw = std_hw1_t[..., 0]
-            mean_chw = mean_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-            std_chw = std_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-            obs_norm_ep = (torch.tensor(obs_img, dtype=torch.float32, device=device) - mean_chw) / std_chw
+            mean = (mean_hw1 if isinstance(mean_hw1, torch.Tensor) else torch.tensor(mean_hw1, device=device)).to(dtype=torch.float32, device=device)
+            std = torch.clamp(torch.as_tensor(std_hw1, dtype=torch.float32, device=device), min=1e-6)
+            mean_chw, std_chw = mean[..., 0].unsqueeze(0).repeat(OBS_CHANNELS, 1, 1), std[..., 0].unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
+            obs_rnd_ep = torch.clamp((torch.tensor(obs_img, dtype=torch.float32, device=device) - mean_chw) / std_chw, OBS_CLIP_MIN, OBS_CLIP_MAX)
             acts_ep = torch.tensor(rollout_data["acts"][ep_idx], dtype=torch.long, device=device)
             logps_ep = torch.tensor(rollout_data["logps"][ep_idx], dtype=torch.float32, device=device)
             vals_i_ep = torch.tensor(rollout_data["vals_int"][ep_idx], dtype=torch.float32, device=device)
