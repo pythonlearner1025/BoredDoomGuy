@@ -1,178 +1,115 @@
-import os
-import math
-import time
-import torch
-import json
-import random
-import threading
-import multiprocessing
+import warnings
+warnings.filterwarnings('ignore')
+
+import os, math, time, torch, json, random, multiprocessing
 import torch.nn as nn
 import torch.nn.functional as F
 import vizdoom as vzd
 import numpy as np
 import wandb
-
 from datetime import datetime
 from PIL import Image
-from queue import Queue
-from model import (
-    RNDAgent, 
-    RunningStats,
-)
+from multiprocessing import Process
+from model import RNDAgent, RunningStats
 
-ITERS = 1000
-EPOCHS = 2  
-FRAME_SKIP = 4
-FRAME_STACK = 4  # Stack last 4 frames as in the paper
-MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(4e4)  # Reduced to avoid OOM
-MAX_FRAMES_PER_EPISODE = int(37.5*60*2)  # Per-thread 1 minute episode limit
+ITERS, EPOCHS = 1000, 2
+FRAME_SKIP, FRAME_STACK = 4, 4
+MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(1e4)
+MAX_FRAMES_PER_EPISODE = int(37.5*60*1)
 
-CLIP_COEF = 0.1
-ENT_COEF_START = 0.10
-ENT_COEF_END = 0.001
-VF_COEF = 0.5
-MAX_GRAD_NORM = 1.0
-MINIBATCH_SIZE = 2048
-LEARNING_RATE = 1e-4
+CLIP_COEF, VF_COEF, MAX_GRAD_NORM = 0.1, 0.5, 1.0
+ENT_COEF_START, ENT_COEF_END = 0.10, 0.001
+MINIBATCH_SIZE, LEARNING_RATE = 2048, 1e-4
+GAMMA_INT, GAMMA_EXT, GAE_LAMBDA = 0.99, 0.999, 0.95
+INTRINSIC_COEF, EXTRINSIC_COEF = 0.8, 0.2
 
-GAMMA_INT = 0.99
-GAMMA_EXT = 0.999
-GAE_LAMBDA = 0.95
-INTRINSIC_COEF = 0.8
-EXTRINSIC_COEF = 0.2
-
-EPSILON_CLAMP = 1e-6
-OBS_HEIGHT = 60
-OBS_WIDTH = 80
+OBS_HEIGHT, OBS_WIDTH = 60, 80
 OBS_CHANNELS = FRAME_STACK
 OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
 
-# Macro actions for Doom E1M1 (no analog delta buttons)
 MACRO_ACTIONS = [
-    [],                                          # 0: NOOP
-    [vzd.Button.MOVE_FORWARD],                   # 1: Forward
-    [vzd.Button.MOVE_BACKWARD],                  # 2: Backward
-    [vzd.Button.TURN_LEFT],                      # 3: Turn left
-    [vzd.Button.TURN_RIGHT],                     # 4: Turn right
-    [vzd.Button.MOVE_FORWARD, vzd.Button.TURN_LEFT],   # 5: Forward + left
-    [vzd.Button.MOVE_FORWARD, vzd.Button.TURN_RIGHT],  # 6: Forward + right
-    [vzd.Button.ATTACK],                         # 7: Attack
-    [vzd.Button.USE],                            # 8: Use
-    [vzd.Button.MOVE_FORWARD, vzd.Button.ATTACK],      # 9: Forward + attack
-    [vzd.Button.MOVE_LEFT],                      # 10: Strafe left
-    [vzd.Button.MOVE_RIGHT],                     # 11: Strafe right
+    [], [vzd.Button.MOVE_FORWARD], [vzd.Button.MOVE_BACKWARD],
+    [vzd.Button.TURN_LEFT], [vzd.Button.TURN_RIGHT],
+    [vzd.Button.MOVE_FORWARD, vzd.Button.TURN_LEFT],
+    [vzd.Button.MOVE_FORWARD, vzd.Button.TURN_RIGHT],
+    [vzd.Button.ATTACK], [vzd.Button.USE],
+    [vzd.Button.MOVE_FORWARD, vzd.Button.ATTACK],
+    [vzd.Button.MOVE_LEFT], [vzd.Button.MOVE_RIGHT],
 ]
 
-BUTTONS_ORDER = sorted(
-    {btn for action in MACRO_ACTIONS for btn in action},
-    key=lambda b: b.value
-)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-
-cpus = multiprocessing.cpu_count()
-n_threads = max(1, cpus - 2)
-print(f"Using {n_threads} worker threads")
-
+BUTTONS_ORDER = sorted({btn for action in MACRO_ACTIONS for btn in action}, key=lambda b: b.value)
 n_actions = len(MACRO_ACTIONS)
 
-torch.autograd.set_detect_anomaly(True)
-os.makedirs('debug', exist_ok=True)
-debug_dir = 'debug/'+datetime.now().strftime('%Y%m%d_%H%M%S')
-os.makedirs(debug_dir, exist_ok=True)
-
 wandb_config = {
-        "iters": ITERS,
-        "epochs": EPOCHS,
-        "max_rollout_frames": MAX_ROLLOUT_FRAMES,
-        "max_frames_per_episode": MAX_FRAMES_PER_EPISODE,
-        "gamma_int": GAMMA_INT,
-        "gamma_ext": GAMMA_EXT,
-        "gae_lambda": GAE_LAMBDA,
-        "clip_coef": CLIP_COEF,
-        "ent_coef_start": ENT_COEF_START,
-        "ent_coef_end": ENT_COEF_END,
-        "vf_coef": VF_COEF,
-        "max_grad_norm": MAX_GRAD_NORM,
-        "minibatch_size": MINIBATCH_SIZE,
-        "policy_lr": LEARNING_RATE,
-        "intrinsic_coef": INTRINSIC_COEF,
-        "extrinsic_coef": EXTRINSIC_COEF,
-        "frame_skip": FRAME_SKIP,
-        "frame_stack": FRAME_STACK,
-        "n_actions": len(MACRO_ACTIONS),
+    k: v for k, v in locals().items() 
+    if k.isupper() and not k.startswith('_') and isinstance(v, (int, float, str, bool))
 }
 
 def init_wandb(config):
-    """Initialize wandb with support for disabled/offline modes."""
-    wandb_mode = os.environ.get("WANDB_MODE", "").lower()
-    wandb_disabled = os.environ.get("WANDB_DISABLED", "").lower()
-    disable = wandb_mode in {"disabled", "offline"} or wandb_disabled in {"true", "1", "yes"}
-    if disable:
-        return wandb.init(mode="disabled", config=config, project="doom-idm-curiosity")
-    return wandb.init(project="doom-idm-curiosity", config=config)
+    mode = "disabled" if os.environ.get("WANDB_MODE", "").lower() in {"disabled", "offline"} else "online"
+    return wandb.init(mode=mode, config=config, project="doom-rnd-curiosity")
 
 def rgb_to_grayscale(rgb_frame):
+    weights = [0.299, 0.587, 0.114]
     if rgb_frame.shape[0] == 3:
-        # CHW format: (3, H, W)
-        gray = (0.299 * rgb_frame[0] +
-                0.587 * rgb_frame[1] +
-                0.114 * rgb_frame[2])
+        gray = sum(w * rgb_frame[i] for i, w in enumerate(weights))
     else:
-        # HWC format: (H, W, 3)
-        gray = (0.299 * rgb_frame[:, :, 0] +
-                0.587 * rgb_frame[:, :, 1] +
-                0.114 * rgb_frame[:, :, 2])
+        gray = sum(w * rgb_frame[:, :, i] for i, w in enumerate(weights))
     return gray.astype(np.uint8)
 
 def resize_gray_frame(gray_frame):
-    """Resize grayscale frame to (OBS_HEIGHT, OBS_WIDTH)."""
-    if gray_frame.shape[0] == OBS_HEIGHT and gray_frame.shape[1] == OBS_WIDTH:
+    if gray_frame.shape[:2] == (OBS_HEIGHT, OBS_WIDTH):
         return gray_frame
-    img = Image.fromarray(gray_frame)
-    resized = img.resize((OBS_WIDTH, OBS_HEIGHT), resample=Image.BILINEAR)
-    return np.array(resized, dtype=np.uint8)
+    return np.array(Image.fromarray(gray_frame).resize((OBS_WIDTH, OBS_HEIGHT), Image.BILINEAR), dtype=np.uint8)
 
 def stack_frames(frame_buffer, new_frame):
-    """Stack last 4 grayscale frames. Returns stacked array (4, H, W)."""
     gray_frame = resize_gray_frame(rgb_to_grayscale(new_frame))
-    if len(frame_buffer) == 0:
-        # Initialize with 4 copies of first frame
-        return [gray_frame] * FRAME_STACK
-    else:
-        frame_buffer = frame_buffer[1:] + [gray_frame]  # Shift and append
-        return frame_buffer
+    return [gray_frame] * FRAME_STACK if not frame_buffer else frame_buffer[1:] + [gray_frame]
        
-def run_episode(thread_id, agent, buffer, frame_counter,
-                save_rgb_debug, device='cpu', ob_rms=None):
+def setup_game():
     game = vzd.DoomGame()
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    wad_path = os.path.join(script_dir, "Doom1.WAD")
+    wad_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Doom1.WAD")
     game.set_doom_game_path(wad_path)
     game.set_doom_map("E1M1")
     game.set_render_hud(False)
-    #game.set_hit_reward(1.0) #hitting barrels also give reward, so disable this
-    game.set_death_reward(-0.5)
-    game.set_kill_reward(10.0)
-    game.set_armor_reward(0.0)
-    game.set_health_reward(0.0)
-    game.set_map_exit_reward(100.0)
-    game.set_secret_reward(50.0)
+    for reward, value in [("death", -0.5), ("kill", 10), ("armor", 0), ("health", 0), ("map_exit", 100), ("secret", 50)]:
+        getattr(game, f"set_{reward}_reward")(value)
     game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
     game.set_window_visible(False)
     game.set_mode(vzd.Mode.PLAYER)
     game.add_game_args("+freelook 1")
     game.set_available_buttons(BUTTONS_ORDER)
     game.init()
+    return game
+
+def normalize_obs(obs, ob_rms, device):
+    obs_t = torch.tensor(obs.astype(np.float32) / 255.0, dtype=torch.float32, device=device).unsqueeze(0)
+    if ob_rms is None:
+        return obs_t
+    _, mean_hw1, std_hw1 = ob_rms.get()
+    mean = (mean_hw1 if isinstance(mean_hw1, torch.Tensor) else torch.tensor(mean_hw1, device=device)).to(dtype=torch.float32, device=device)
+    std = torch.clamp(torch.as_tensor(std_hw1, dtype=torch.float32, device=device), min=1e-6)
+    mean_chw, std_chw = mean[..., 0].unsqueeze(0).repeat(OBS_CHANNELS, 1, 1), std[..., 0].unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
+    return ((obs_t.squeeze(0) - mean_chw) / std_chw).unsqueeze(0)
+
+def run_episode(process_id, agent_state_dict, buffer, frame_counter, save_rgb_debug, device_str='cpu', ob_rms_data=None):
+    device = torch.device(device_str)
+    agent = RNDAgent(OBS_SIZE, n_actions, hidden=(256,256), rnd_feat_dim=128, conv_out_dim=128).to(device)
+    agent.load_state_dict(agent_state_dict)
+    agent.eval()
+    
+    ob_rms = None
+    if ob_rms_data:
+        ob_rms = RunningStats(shape=(OBS_HEIGHT, OBS_WIDTH, 1), dtype=torch.float32, device=device)
+        ob_rms.count, ob_rms.mean, ob_rms.var = ob_rms_data
+    
+    game = setup_game()
     game.new_episode()
 
-    obss = []  # Stacked frames (4, H, W) uint8 grayscale
+    obss, acts, logps, vals_int, vals_ext, rwds_e, dones = [], [], [], [], [], [], []
     obss_rgb = [] if save_rgb_debug else None
-    acts, logps, vals_int, vals_ext, rwds_e, dones = [], [], [], [], [], []
-
-    frames_collected = 0
-    frame_buffer = []
+    frame_buffer, frames_collected = [], 0
+    timings = {k: [] for k in ['state_get', 'frame_stack', 'obs_norm', 'agent_fwd', 'action_prep', 'env_step', 'data_collect']}
 
     while frames_collected < MAX_FRAMES_PER_EPISODE:
         if game.is_episode_finished():
@@ -180,235 +117,183 @@ def run_episode(thread_id, agent, buffer, frame_counter,
             frame_buffer = []
             continue
 
-        state = game.get_state()
+        t0, state = time.time(), game.get_state()
         if state is None:
             continue
+        timings['state_get'].append(time.time() - t0)
 
-        raw_frame = state.screen_buffer  # (3, H, W) RGB uint8 CHW format
-        raw_frame_hwc = raw_frame.transpose(1, 2, 0)  # Convert to (H, W, 3) for saving
+        t0 = time.time()
+        raw_frame = state.screen_buffer
         frame_buffer = stack_frames(frame_buffer, raw_frame)
-        obs_stacked_np = np.stack(frame_buffer, axis=0)  # (4, H, W) grayscale uint8
-        # Normalize to [0,1]
-        obs_img = (obs_stacked_np.astype(np.float32) / 255.0)
-        obs_t = torch.tensor(obs_img, dtype=torch.float32, device=device).unsqueeze(0)  # (1,C,H,W)
-        # Apply observation normalization using last frame stats (broadcast across channels)
-        if ob_rms is not None:
-            _, mean_hw1, std_hw1 = ob_rms.get()
-            if isinstance(mean_hw1, torch.Tensor):
-                mean_hw1_t = mean_hw1.to(dtype=torch.float32, device=device)
-                std_hw1_t = torch.as_tensor(std_hw1, dtype=torch.float32, device=device)
-            else:
-                mean_hw1_t = torch.tensor(mean_hw1, dtype=torch.float32, device=device)
-                std_hw1_t = torch.tensor(std_hw1, dtype=torch.float32, device=device)
-            mean_hw = mean_hw1_t[..., 0]  # (H,W)
-            std_hw = torch.clamp(std_hw1_t[..., 0], min=1e-6)
-            mean_chw = mean_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-            std_chw = std_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-            obs_t = (obs_t.squeeze(0) - mean_chw) / std_chw
-            obs_t = obs_t.unsqueeze(0)
+        obs_stacked_np = np.stack(frame_buffer, axis=0)
+        timings['frame_stack'].append(time.time() - t0)
+        
+        t0, obs_t = time.time(), normalize_obs(obs_stacked_np, ob_rms, device)
+        timings['obs_norm'].append(time.time() - t0)
 
         with torch.no_grad():
+            t0 = time.time()
             action, _, logp, v_int, v_ext = agent.step(obs_t)
-            act_idx_item = int(action)
+            timings['agent_fwd'].append(time.time() - t0)
 
-        action_buttons = MACRO_ACTIONS[act_idx_item]
-        action_vector = [btn in action_buttons for btn in BUTTONS_ORDER]
-        rwd_e = game.make_action(action_vector, FRAME_SKIP)
-        done_flag = game.is_episode_finished()
+        t0, act_idx = time.time(), int(action)
+        action_vector = [btn in MACRO_ACTIONS[act_idx] for btn in BUTTONS_ORDER]
+        timings['action_prep'].append(time.time() - t0)
+        
+        t0, rwd_e = time.time(), game.make_action(action_vector, FRAME_SKIP)
+        timings['env_step'].append(time.time() - t0)
 
+        t0 = time.time()
         obss.append(obs_stacked_np.astype(np.uint8))
-        if save_rgb_debug: obss_rgb.append(raw_frame_hwc)
-
-        acts.append(act_idx_item)
-        logps.append(float(logp))
-        vals_int.append(float(v_int))
-        vals_ext.append(float(v_ext))
-        rwds_e.append(rwd_e)
-        dones.append(done_flag)
-
+        if save_rgb_debug:
+            obss_rgb.append(raw_frame.transpose(1, 2, 0))
+        acts.extend([act_idx])
+        logps.extend([float(logp)])
+        vals_int.extend([float(v_int)])
+        vals_ext.extend([float(v_ext)])
+        rwds_e.extend([rwd_e])
+        dones.extend([game.is_episode_finished()])
+        timings['data_collect'].append(time.time() - t0)
         frames_collected += FRAME_SKIP
 
-    with frame_counter:
-        frame_counter.count += len(obss) * FRAME_SKIP
-
+    frame_counter.add(len(obss) * FRAME_SKIP)
     game.close()
 
-    # Compute intrinsic rewards from normalized image observations
-    obss_np = np.array(obss, dtype=np.uint8)  # (T, 4, H, W)
-    obs_img = (obss_np.astype(np.float32) / 255.0)
-    obs_t_img = torch.as_tensor(obs_img, dtype=torch.float32, device=device)  # (T,C,H,W)
-    if ob_rms is not None:
-        _, mean_hw1, std_hw1 = ob_rms.get()
-        mean_hw1_t = mean_hw1 if isinstance(mean_hw1, torch.Tensor) else torch.tensor(mean_hw1)
-        std_hw1_t = std_hw1 if isinstance(std_hw1, torch.Tensor) else torch.tensor(std_hw1)
-        mean_hw1_t = mean_hw1_t.to(dtype=torch.float32, device=device)
-        std_hw1_t = torch.clamp(torch.as_tensor(std_hw1_t, dtype=torch.float32, device=device), min=1e-6)
-        mean_hw = mean_hw1_t[..., 0]  # (H,W)
-        std_hw = std_hw1_t[..., 0]
-        mean_chw = mean_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-        std_chw = std_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-        obs_t_img = (obs_t_img - mean_chw) / std_chw
+    t0, obss_batch = time.time(), torch.as_tensor(np.array(obss, dtype=np.uint8).astype(np.float32) / 255.0, dtype=torch.float32, device=device)
+    if ob_rms:
+        _, mean, std = ob_rms.get()
+        mean = (mean if isinstance(mean, torch.Tensor) else torch.tensor(mean, device=device)).to(dtype=torch.float32, device=device)
+        std = torch.clamp(torch.as_tensor(std, dtype=torch.float32, device=device), min=1e-6)
+        mean_chw, std_chw = mean[..., 0].unsqueeze(0).repeat(OBS_CHANNELS, 1, 1), std[..., 0].unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
+        obss_batch = (obss_batch - mean_chw) / std_chw
     with torch.no_grad():
-        rwds_i_t = agent.rnd.intrinsic_reward(obs_t_img)
-    rwds_i = rwds_i_t.detach().cpu().numpy().tolist()
+        rwds_i = agent.rnd.intrinsic_reward(obss_batch).detach().cpu().numpy().tolist()
+    timings['intrinsic'], timings['n_steps'] = time.time() - t0, len(obss)
 
-    buffer.put((thread_id, obss, acts, logps, vals_int, vals_ext, rwds_e, rwds_i, dones, obss_rgb))
+    buffer.put((process_id, obss, acts, logps, vals_int, vals_ext, rwds_e, rwds_i, dones, obss_rgb, timings))
 
 class FrameCounter:
-    def __init__(self):
-        self.count = 0
-        self.lock = threading.Lock()
-
-    def __enter__(self):
-        self.lock.acquire()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.lock.release()
-
+    def __init__(self, manager):
+        self.count, self.lock = manager.Value('i', 0), manager.Lock()
     def get(self):
         with self.lock:
-            return self.count
-
-    def reset(self):
+            return self.count.value
+    def add(self, value):
         with self.lock:
-            self.count = 0
+            self.count.value += value
 
-def run_parallel_episodes(n_threads, agent, buffer, frame_counter,
-                         debug_thread_id, device='cpu', ob_rms=None):
-    threads = []
-    for tid in range(n_threads):
-        save_rgb = (tid == debug_thread_id)  # Only one thread saves RGB
-        t = threading.Thread(
-            target=run_episode,
-            args=(tid, agent, buffer, frame_counter, save_rgb, device, ob_rms)
-        )
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
+def run_parallel_episodes(n_procs, agent_state_dict, buffer, frame_counter, debug_proc_id, device='cpu', ob_rms=None):
+    ob_rms_data = None
+    if ob_rms:
+        count, mean, var = ob_rms.get()
+        ob_rms_data = (count, mean.cpu() if isinstance(mean, torch.Tensor) else mean, var.cpu() if isinstance(var, torch.Tensor) else var)
+    
+    processes = [Process(target=run_episode, args=(pid, agent_state_dict, buffer, frame_counter, pid == debug_proc_id, 'cpu', ob_rms_data)) for pid in range(n_procs)]
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join()
 
-def ppo_update(agent, optimizer, obs_mb , act_mb, old_logp_mb,
-               adv_mb, ret_int_mb, ret_ext_mb, clip_coef=CLIP_COEF, 
-               ent_coef=0.01, vf_coef=VF_COEF):
-
+def ppo_update(agent, optimizer, obs_mb, act_mb, old_logp_mb, adv_mb, ret_int_mb, ret_ext_mb, clip_coef=CLIP_COEF, ent_coef=0.01, vf_coef=VF_COEF):
     adv_mb = (adv_mb - adv_mb.mean()) / (adv_mb.std() + 1e-8)
     logits, v_int_new, v_ext_new = agent.forward(obs_mb)
     dist = torch.distributions.Categorical(logits=logits)
-    # FIXED: Negative log-prob / log-prob sign conventions and ratio
-    logp_new_mb = dist.log_prob(act_mb)
-    entropy = dist.entropy().mean()
-    ratio = (logp_new_mb - old_logp_mb).exp()
+    logp_new_mb, entropy, ratio = dist.log_prob(act_mb), dist.entropy().mean(), (dist.log_prob(act_mb) - old_logp_mb).exp()
 
-    unclipped = ratio * adv_mb
-    clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_mb
-    pi_loss = -torch.min(unclipped, clipped).mean()
-
-    v_loss_int = 0.5 * F.mse_loss(v_int_new, ret_int_mb)
-    v_loss_ext = 0.5 * F.mse_loss(v_ext_new, ret_ext_mb)
-    v_loss = v_loss_int + v_loss_ext
-
-    ent_loss = -entropy
-
+    pi_loss = -torch.min(ratio * adv_mb, torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_mb).mean()
+    v_loss_int, v_loss_ext = 0.5 * F.mse_loss(v_int_new, ret_int_mb), 0.5 * F.mse_loss(v_ext_new, ret_ext_mb)
     rnd_loss = agent.rnd.predictor_loss(obs_mb).mean()
 
-    total_loss = pi_loss + vf_coef * v_loss + ent_coef * ent_loss + rnd_loss
+    total_loss = pi_loss + vf_coef * (v_loss_int + v_loss_ext) - ent_coef * entropy + rnd_loss
     optimizer.zero_grad()
     total_loss.backward()
     nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
     optimizer.step()
-    return pi_loss.item(), v_loss.item(), v_loss_int.item(), v_loss_ext.item(), ent_loss.item(), rnd_loss.item()
+    return pi_loss.item(), (v_loss_int + v_loss_ext).item(), v_loss_int.item(), v_loss_ext.item(), -entropy.item(), rnd_loss.item()
 
-def compute_gae_1d(rewards: torch.Tensor,
-                   values: torch.Tensor,
-                   dones: torch.Tensor,
-                   gamma: float,
-                   gae_lambda: float) -> (torch.Tensor, torch.Tensor):
-    """Compute GAE for a single episode sequence.
-    rewards, values, dones: shape (T,)
-    Returns: advantages, returns of shape (T,)
-    Note: we bootstrap with 0 at the end regardless of done; this is robust and avoids shape issues.
-    """
-    T = rewards.shape[0]
-    device = rewards.device
-    advantages = torch.zeros(T, dtype=torch.float32, device=device)
-    lastgaelam = 0.0
+def compute_gae_1d(rewards, values, dones, gamma, gae_lambda):
+    T, device = rewards.shape[0], rewards.device
+    advantages, lastgaelam = torch.zeros(T, dtype=torch.float32, device=device), 0.0
     for t in reversed(range(T)):
-        if t == T - 1:
-            nextnonterminal = 0.0 if (dones[t].float() > 0.5) else 1.0
-            nextvalues = torch.tensor(0.0, dtype=torch.float32, device=device)
-        else:
-            nextnonterminal = 0.0 if (dones[t+1].float() > 0.5) else 1.0
-            nextvalues = values[t+1]
+        nextnonterminal = 0.0 if (dones[t if t == T - 1 else t+1].float() > 0.5) else 1.0
+        nextvalues = torch.tensor(0.0, dtype=torch.float32, device=device) if t == T - 1 else values[t+1]
         delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
         lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
         advantages[t] = lastgaelam
-    returns = advantages + values
-    return advantages, returns
+    return advantages, advantages + values
 
-def compute_gae(rewards, values, dones, gamma, gae_lambda):
-    T, N = rewards.shape
-    device = rewards.device
-    advantages = torch.zeros_like(rewards)
-    lastgaelam = torch.zeros(N, device=device)
-    for t in reversed(range(T)):
-        if t == T - 1:
-            nextnonterminal = 1.0 - (dones[:, t])
-            nextvalues = values[:, t]  
-        else:
-            nextnonterminal = 1.0 - (dones[:, t+1])
-            nextvalues = values[:, t+1]
-        delta = rewards[:, t] + gamma * nextvalues * nextnonterminal - values[:,    t]
-        lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
-        advantages[:, t] = lastgaelam
-
-    returns = advantages + values
-    return advantages, returns
+def setup_device():
+    if torch.cuda.is_available():
+        return torch.device('cuda'), "CUDA GPU"
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        try:
+            device = torch.device('mps')
+            torch.zeros(1).to(device)
+            return device, "MPS (Metal)"
+        except:
+            pass
+    return torch.device('cpu'), "CPU"
 
 if __name__ == '__main__':
+    multiprocessing.set_start_method('spawn', force=True)
+    
+    import sys
+    n_threads = int(sys.argv[1]) if len(sys.argv) > 1 else multiprocessing.cpu_count() - 4
+    device, device_name = setup_device()
+    print(f"Device: {device_name} | Workers: {n_threads}")
+    
+    torch.autograd.set_detect_anomaly(True)
+    debug_dir = f'debug/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    os.makedirs(debug_dir, exist_ok=True)
+
     init_wandb(wandb_config)
     agent = RNDAgent(OBS_SIZE, n_actions, hidden=(256,256), rnd_feat_dim=128, conv_out_dim=128).to(device)
+    
+    if device.type != 'mps':
+        try:
+            agent = torch.compile(agent, mode='default')
+            print("torch.compile: enabled")
+        except:
+            print("torch.compile: failed")
+    
     agent_optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
     rff_rms = RunningStats()
-    # Observation RunningStats for last-frame normalization: shape (H, W, 1)
     ob_rms = RunningStats(shape=(OBS_HEIGHT, OBS_WIDTH, 1), dtype=torch.float32, device=device)
 
     for iter_idx in range(ITERS):
         print(f"\n=== Iteration {iter_idx+1}/{ITERS} ===")
         iter_start = time.time()
+        
+        agent.eval()
+        agent_state_dict = {k.replace('_orig_mod.', ''): v.cpu() for k, v in agent.state_dict().items()}
+        manager = multiprocessing.Manager()
+        buffer, frame_counter, debug_proc_id = manager.Queue(), FrameCounter(manager), random.randint(0, n_threads - 1)
 
-        buffer = Queue()
-        frame_counter = FrameCounter()
-        debug_thread_id = random.randint(0, n_threads - 1)
-
-        debug_episode_saved = False
-        total_episodes = 0
-        rollout_data = {
-            "obs": [],
-            "acts": [],
-            "logps": [],
-            "vals_int": [],
-            "vals_ext": [],
-            "rwds_e": [],
-            "rwds_i": [],
-            "dones": [],
-            "rollout_rwds_i_raw": [],
-            "rollout_rwds_e_raw": [],
-        }
+        debug_episode_saved, total_episodes = False, 0
+        rollout_data = {k: [] for k in ['obs', 'acts', 'logps', 'vals_int', 'vals_ext', 'rwds_e', 'rwds_i', 'dones', 'rollout_rwds_i_raw', 'rollout_rwds_e_raw']}
+        timing_data = {k: [] for k in ['state_get', 'frame_stack', 'obs_norm', 'agent_fwd', 'action_prep', 'env_step', 'data_collect', 'intrinsic']}
+        start_time = time.time()
 
         while frame_counter.get() < MAX_ROLLOUT_FRAMES:
             run_parallel_episodes(
-                n_threads, agent, buffer, frame_counter, debug_thread_id, device, ob_rms
+                n_threads, agent_state_dict, buffer, frame_counter, debug_proc_id, device, ob_rms
             )
 
             while not buffer.empty():
                 ep = buffer.get()
-                (thread_id, obss, acts, logps, vals_int, vals_ext,
+                (proc_id, obss, acts, logps, vals_int, vals_ext,
                  rwds_e, rwds_i, dones,
-                 obss_rgb) = ep
+                 obss_rgb, timing_stats) = ep
                 total_episodes += 1
+                
+                # Aggregate timing data
+                for key in timing_data.keys():
+                    if key == 'intrinsic':
+                        timing_data[key].append(timing_stats[key])
+                    else:
+                        timing_data[key].extend(timing_stats[key])
 
-                if thread_id == debug_thread_id and not debug_episode_saved and obss_rgb is not None:
+                if proc_id == debug_proc_id and not debug_episode_saved and obss_rgb is not None:
                     save_frame_dir = f'{debug_dir}/iter_{iter_idx+1:04d}'
                     os.makedirs(save_frame_dir)
                     action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
@@ -425,21 +310,24 @@ if __name__ == '__main__':
 
                     debug_episode_saved = True
 
-                # FIXED: don't flatline everything 
-                rollout_data["obs"].append(obss)
-                rollout_data["acts"].append(acts)
-                rollout_data["logps"].append(logps)
-                rollout_data["vals_int"].append(vals_int)
-                rollout_data["vals_ext"].append(vals_ext)
-                rollout_data["rwds_e"].append(rwds_e)
-                rollout_data["rwds_i"].append(rwds_i)
-                rollout_data["dones"].append(dones)
+                for k, v in zip(['obs', 'acts', 'logps', 'vals_int', 'vals_ext', 'rwds_e', 'rwds_i', 'dones'], [obss, acts, logps, vals_int, vals_ext, rwds_e, rwds_i, dones]):
+                    rollout_data[k].append(v)
                 rollout_data["rollout_rwds_i_raw"].append(rwds_i)
                 rollout_data["rollout_rwds_e_raw"].append(rwds_e)
-                del ep, obss, obss_rgb
+        
+        # Read values from manager before shutdown
+        total_frames = frame_counter.get()
+        
+        # Clean up multiprocessing manager
+        manager.shutdown()
 
-        print(f"Collected {total_episodes} episodes, {frame_counter.get()} frames")
-
+        rollout_time = time.time() - start_time
+        print(f"Rollout: {total_episodes}ep {total_frames}f in {rollout_time:.2f}s")
+        
+        if timing_data['agent_fwd']:
+            timings_ms = {k: np.mean(v)*1000 for k, v in timing_data.items() if isinstance(v, list) and v}
+            total_ms = sum(timings_ms[k] for k in ['state_get', 'frame_stack', 'obs_norm', 'agent_fwd', 'action_prep', 'env_step', 'data_collect'])
+            print(f"Timing: Agent={timings_ms['agent_fwd']:.2f}ms Env={timings_ms['env_step']:.2f}ms Total={total_ms:.2f}ms/step")
         # Build reward forward filter over all episodes (scalar running stats)
         filtered_intrinsic_all = []
         for rw_i_ep in rollout_data["rwds_i"]:
@@ -473,22 +361,22 @@ if __name__ == '__main__':
             # Prepare normalized observations for training (N,C,H,W) using last-frame stats
             obs_img = (obss_ep.astype(np.float32) / 255.0)
             _, mean_hw1, std_hw1 = ob_rms.get()
-            mean_hw1_t = mean_hw1 if isinstance(mean_hw1, torch.Tensor) else torch.tensor(mean_hw1)
-            std_hw1_t = std_hw1 if isinstance(std_hw1, torch.Tensor) else torch.tensor(std_hw1)
-            mean_hw1_t = mean_hw1_t.to(dtype=torch.float32)
-            std_hw1_t = torch.clamp(torch.as_tensor(std_hw1_t, dtype=torch.float32), min=1e-6)
+            mean_hw1_t = mean_hw1 if isinstance(mean_hw1, torch.Tensor) else torch.tensor(mean_hw1, device=device)
+            std_hw1_t = std_hw1 if isinstance(std_hw1, torch.Tensor) else torch.tensor(std_hw1, device=device)
+            mean_hw1_t = mean_hw1_t.to(dtype=torch.float32, device=device)
+            std_hw1_t = torch.clamp(torch.as_tensor(std_hw1_t, dtype=torch.float32, device=device), min=1e-6)
             mean_hw = mean_hw1_t[..., 0]  # (H,W)
             std_hw = std_hw1_t[..., 0]
             mean_chw = mean_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
             std_chw = std_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-            obs_norm_ep = (torch.tensor(obs_img, dtype=torch.float32) - mean_chw) / std_chw
-            acts_ep = torch.tensor(rollout_data["acts"][ep_idx], dtype=torch.long)
-            logps_ep = torch.tensor(rollout_data["logps"][ep_idx], dtype=torch.float32)
-            vals_i_ep = torch.tensor(rollout_data["vals_int"][ep_idx], dtype=torch.float32)
-            vals_e_ep = torch.tensor(rollout_data["vals_ext"][ep_idx], dtype=torch.float32)
-            dones_ep = torch.tensor(rollout_data["dones"][ep_idx], dtype=torch.bool)
-            rwds_e_ep = torch.tensor(rollout_data["rwds_e"][ep_idx], dtype=torch.float32)
-            rwds_i_raw_ep = torch.tensor(rollout_data["rwds_i"][ep_idx], dtype=torch.float32)
+            obs_norm_ep = (torch.tensor(obs_img, dtype=torch.float32, device=device) - mean_chw) / std_chw
+            acts_ep = torch.tensor(rollout_data["acts"][ep_idx], dtype=torch.long, device=device)
+            logps_ep = torch.tensor(rollout_data["logps"][ep_idx], dtype=torch.float32, device=device)
+            vals_i_ep = torch.tensor(rollout_data["vals_int"][ep_idx], dtype=torch.float32, device=device)
+            vals_e_ep = torch.tensor(rollout_data["vals_ext"][ep_idx], dtype=torch.float32, device=device)
+            dones_ep = torch.tensor(rollout_data["dones"][ep_idx], dtype=torch.bool, device=device)
+            rwds_e_ep = torch.tensor(rollout_data["rwds_e"][ep_idx], dtype=torch.float32, device=device)
+            rwds_i_raw_ep = torch.tensor(rollout_data["rwds_i"][ep_idx], dtype=torch.float32, device=device)
 
             # normalize intrinsic rewards by running std of filtered intrinsic
             rwds_i_norm_ep = rwds_i_raw_ep / std_i_running
@@ -526,6 +414,9 @@ if __name__ == '__main__':
 
         total_pi_loss, total_v_loss, total_v_loss_i, total_v_loss_e, total_ent_loss, total_rnd_loss, n_updates = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
+        # Set main agent back to train mode for updates
+        agent.train()
+        
         for epoch in range(EPOCHS):
             np.random.shuffle(indices)
             epoch_start = time.time()
@@ -603,9 +494,9 @@ if __name__ == '__main__':
             "reward/intrinsic_batch_min": batch_min_i,
             "reward/total_batch": batch_total,
             "time/iteration_time": iter_time,
-            "time/fps": frame_counter.get() / iter_time,
+            "time/fps": total_frames / iter_time,
             "data/episodes_collected": total_episodes,
-            "data/frames_collected": frame_counter.get(),
+            "data/frames_collected": total_frames,
         }
 
         with open(f'{debug_dir}/log_{iter_idx:04d}.json', 'w') as f:
@@ -615,7 +506,7 @@ if __name__ == '__main__':
             print(k, ": ", v)
         
         wandb.log(log_dict)
-        print(f"Timer {iter_time:.1f}s | FPS: {frame_counter.get()/iter_time:.0f}")
+        print(f"Timer {iter_time:.1f}s | FPS: {total_frames/iter_time:.0f}")
         print(f"Policy Loss: {pi_loss:.4f}, Value Loss: {v_loss:.4f}, Entropy: {-ent_loss:.4f}")
         print(f"RND Loss: {rnd_loss:.4f}")
         print("--------------------------------")
