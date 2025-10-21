@@ -147,7 +147,9 @@ err_loss = F.mse_loss(eps_pred, torch.log(eps_b + EPSILON_CLAMP))
 - [ad61d92](https://github.com/pythonlearner1025/BoredDoomGuy/tree/ad61d92db335c3f47582ac28a72a787239281aa9): 
     - This is an implementation of OpenAI's [Random Network Distillation](https://openai.com/index/reinforcement-learning-with-prediction-based-rewards/) work
     - Empirically, with INTRINSIC_COEF=EXTRINSIC_COEF=0.5, it was the only implementation out of ICM (Pathak et al, 2017) and LPM (Hou et al, 2025) that didn't asymptotically converge to zero reward. 
+    ![Total Reward Across Iterations](https://github.com/pythonlearner1025/BoredDoomGuy/blob/master/assets/RND_total_batch.png)
     - However, intrinsic reward collapses to zero early on and the policy is updated only by extrinsic rewards - i.e. it behaves no differently than a PPO agent with reward scaled by half. 
+    ![Intrinsic Reward Collapse](https://github.com/pythonlearner1025/BoredDoomGuy/blob/master/assets/RND_intrinsic_batch_mean.png)
     - I am setting EXTRINSIC_COEF=1.0 to investigate if purely curiosity driven agent can gain external rewards + exhibit complex behavior (kills enemies, finds secret room, completes level) 
 
 ## 7. TODOs for future revision
