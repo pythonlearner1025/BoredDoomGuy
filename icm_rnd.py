@@ -38,14 +38,20 @@ LEARNING_RATE = 1e-4
 GAMMA_INT = 0.99
 GAMMA_EXT = 0.999
 GAE_LAMBDA = 0.95
-INTRINSIC_COEF = 0.5
-EXTRINSIC_COEF = 0.5
+INTRINSIC_COEF = 1.0
+EXTRINSIC_COEF = 0.0
+
+# "Death is not the end" - treat episode boundaries as non-terminal for GAE
+IGNORE_DONES = True
 
 EPSILON_CLAMP = 1e-6
 OBS_HEIGHT = 60
 OBS_WIDTH = 80
 OBS_CHANNELS = FRAME_STACK
 OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
+OBS_RANDOM_WARMUP_STEPS = 10000
+OBS_CLIP_MIN = -5.0
+OBS_CLIP_MAX = 5.0
 
 # Macro actions for Doom E1M1 (no analog delta buttons)
 MACRO_ACTIONS = [
@@ -97,6 +103,7 @@ wandb_config = {
         "max_grad_norm": MAX_GRAD_NORM,
         "minibatch_size": MINIBATCH_SIZE,
         "policy_lr": LEARNING_RATE,
+        "ignore_dones": IGNORE_DONES,
         "intrinsic_coef": INTRINSIC_COEF,
         "extrinsic_coef": EXTRINSIC_COEF,
         "frame_skip": FRAME_SKIP,
@@ -143,6 +150,59 @@ def stack_frames(frame_buffer, new_frame):
     else:
         frame_buffer = frame_buffer[1:] + [gray_frame]  # Shift and append
         return frame_buffer
+
+class RandomAgent:
+    """Uniformly samples a macro action index for warmup."""
+    def __init__(self, n_actions: int):
+        self.n_actions = n_actions
+
+    def act(self) -> int:
+        return random.randint(0, self.n_actions - 1)
+
+def warmup_observation_stats(ob_rms):
+    """Collect observations with a random policy to initialize ob_rms."""
+    game = vzd.DoomGame()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    wad_path = os.path.join(script_dir, "Doom1.WAD")
+    game.set_doom_game_path(wad_path)
+    game.set_doom_map("E1M1")
+    game.set_render_hud(False)
+    game.set_death_reward(-0.5)
+    game.set_kill_reward(10.0)
+    game.set_armor_reward(0.0)
+    game.set_health_reward(0.0)
+    game.set_map_exit_reward(100.0)
+    game.set_secret_reward(50.0)
+    game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
+    game.set_window_visible(False)
+    game.set_mode(vzd.Mode.PLAYER)
+    game.add_game_args("+freelook 1")
+    game.set_available_buttons(BUTTONS_ORDER)
+    game.init()
+    game.new_episode()
+
+    rand_agent = RandomAgent(len(MACRO_ACTIONS))
+    steps = 0
+    while steps < OBS_RANDOM_WARMUP_STEPS:
+        if game.is_episode_finished():
+            game.new_episode()
+            continue
+        state = game.get_state()
+        if state is None:
+            continue
+        raw_frame = state.screen_buffer  # (3, H, W)
+        gray = resize_gray_frame(rgb_to_grayscale(raw_frame))  # (H, W)
+        gray01 = (gray.astype(np.float32) / 255.0)
+        sample = torch.tensor(gray01[..., None], dtype=torch.float32, device=device)
+        ob_rms.update(sample)
+
+        act_idx = rand_agent.act()
+        action_buttons = MACRO_ACTIONS[act_idx]
+        action_vector = [btn in action_buttons for btn in BUTTONS_ORDER]
+        game.make_action(action_vector, FRAME_SKIP)
+        steps += 1
+
+    game.close()
        
 def run_episode(thread_id, agent, buffer, frame_counter,
                 save_rgb_debug, device='cpu', ob_rms=None):
@@ -188,27 +248,12 @@ def run_episode(thread_id, agent, buffer, frame_counter,
         raw_frame_hwc = raw_frame.transpose(1, 2, 0)  # Convert to (H, W, 3) for saving
         frame_buffer = stack_frames(frame_buffer, raw_frame)
         obs_stacked_np = np.stack(frame_buffer, axis=0)  # (4, H, W) grayscale uint8
-        # Normalize to [0,1]
+        # Normalize to [0,1] for policy/value networks (no whitening per paper guidance)
         obs_img = (obs_stacked_np.astype(np.float32) / 255.0)
-        obs_t = torch.tensor(obs_img, dtype=torch.float32, device=device).unsqueeze(0)  # (1,C,H,W)
-        # Apply observation normalization using last frame stats (broadcast across channels)
-        if ob_rms is not None:
-            _, mean_hw1, std_hw1 = ob_rms.get()
-            if isinstance(mean_hw1, torch.Tensor):
-                mean_hw1_t = mean_hw1.to(dtype=torch.float32, device=device)
-                std_hw1_t = torch.as_tensor(std_hw1, dtype=torch.float32, device=device)
-            else:
-                mean_hw1_t = torch.tensor(mean_hw1, dtype=torch.float32, device=device)
-                std_hw1_t = torch.tensor(std_hw1, dtype=torch.float32, device=device)
-            mean_hw = mean_hw1_t[..., 0]  # (H,W)
-            std_hw = torch.clamp(std_hw1_t[..., 0], min=1e-6)
-            mean_chw = mean_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-            std_chw = std_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-            obs_t = (obs_t.squeeze(0) - mean_chw) / std_chw
-            obs_t = obs_t.unsqueeze(0)
+        obs_t_policy = torch.tensor(obs_img, dtype=torch.float32, device=device).unsqueeze(0)  # (1,C,H,W)
 
         with torch.no_grad():
-            action, _, logp, v_int, v_ext = agent.step(obs_t)
+            action, _, logp, v_int, v_ext = agent.step(obs_t_policy)
             act_idx_item = int(action)
 
         action_buttons = MACRO_ACTIONS[act_idx_item]
@@ -233,7 +278,7 @@ def run_episode(thread_id, agent, buffer, frame_counter,
 
     game.close()
 
-    # Compute intrinsic rewards from normalized image observations
+    # Compute intrinsic rewards from normalized+clipped image observations for RND
     obss_np = np.array(obss, dtype=np.uint8)  # (T, 4, H, W)
     obs_img = (obss_np.astype(np.float32) / 255.0)
     obs_t_img = torch.as_tensor(obs_img, dtype=torch.float32, device=device)  # (T,C,H,W)
@@ -247,9 +292,8 @@ def run_episode(thread_id, agent, buffer, frame_counter,
         std_hw = std_hw1_t[..., 0]
         mean_chw = mean_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
         std_chw = std_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-        obs_t_img = (obs_t_img - mean_chw) / std_chw
-    with torch.no_grad():
-        rwds_i_t = agent.rnd.intrinsic_reward(obs_t_img)
+        obs_t_img = torch.clamp((obs_t_img - mean_chw) / std_chw, min=OBS_CLIP_MIN, max=OBS_CLIP_MAX)
+    rwds_i_t = agent.rnd.intrinsic_reward(obs_t_img)
     rwds_i = rwds_i_t.detach().cpu().numpy().tolist()
 
     buffer.put((thread_id, obss, acts, logps, vals_int, vals_ext, rwds_e, rwds_i, dones, obss_rgb))
@@ -288,12 +332,12 @@ def run_parallel_episodes(n_threads, agent, buffer, frame_counter,
     for t in threads:
         t.join()
 
-def ppo_update(agent, optimizer, obs_mb , act_mb, old_logp_mb,
+def ppo_update(agent, optimizer, obs_policy_mb, obs_rnd_mb , act_mb, old_logp_mb,
                adv_mb, ret_int_mb, ret_ext_mb, clip_coef=CLIP_COEF, 
                ent_coef=0.01, vf_coef=VF_COEF):
 
     adv_mb = (adv_mb - adv_mb.mean()) / (adv_mb.std() + 1e-8)
-    logits, v_int_new, v_ext_new = agent.forward(obs_mb)
+    logits, v_int_new, v_ext_new = agent.forward(obs_policy_mb)
     dist = torch.distributions.Categorical(logits=logits)
     # FIXED: Negative log-prob / log-prob sign conventions and ratio
     logp_new_mb = dist.log_prob(act_mb)
@@ -310,7 +354,7 @@ def ppo_update(agent, optimizer, obs_mb , act_mb, old_logp_mb,
 
     ent_loss = -entropy
 
-    rnd_loss = agent.rnd.predictor_loss(obs_mb).mean()
+    rnd_loss = agent.rnd.predictor_loss(obs_rnd_mb).mean()
 
     total_loss = pi_loss + vf_coef * v_loss + ent_coef * ent_loss + rnd_loss
     optimizer.zero_grad()
@@ -323,11 +367,13 @@ def compute_gae_1d(rewards: torch.Tensor,
                    values: torch.Tensor,
                    dones: torch.Tensor,
                    gamma: float,
-                   gae_lambda: float) -> (torch.Tensor, torch.Tensor):
+                   gae_lambda: float,
+                   ignore_dones: bool = False) -> (torch.Tensor, torch.Tensor):
     """Compute GAE for a single episode sequence.
     rewards, values, dones: shape (T,)
     Returns: advantages, returns of shape (T,)
-    Note: we bootstrap with 0 at the end regardless of done; this is robust and avoids shape issues.
+    Note: we keep zero-bootstrap at the sequence end. If ignore_dones=True,
+    we bypass terminal gating within the sequence only (no extra bootstrap).
     """
     T = rewards.shape[0]
     device = rewards.device
@@ -335,29 +381,41 @@ def compute_gae_1d(rewards: torch.Tensor,
     lastgaelam = 0.0
     for t in reversed(range(T)):
         if t == T - 1:
-            nextnonterminal = 0.0 if (dones[t].float() > 0.5) else 1.0
             nextvalues = torch.tensor(0.0, dtype=torch.float32, device=device)
+            if ignore_dones:
+                nextnonterminal = 1.0
+            else:
+                nextnonterminal = 0.0 if (dones[t].float() > 0.5) else 1.0
         else:
-            nextnonterminal = 0.0 if (dones[t+1].float() > 0.5) else 1.0
             nextvalues = values[t+1]
+            if ignore_dones:
+                nextnonterminal = 1.0
+            else:
+                nextnonterminal = 0.0 if (dones[t+1].float() > 0.5) else 1.0
         delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
         lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
         advantages[t] = lastgaelam
     returns = advantages + values
     return advantages, returns
 
-def compute_gae(rewards, values, dones, gamma, gae_lambda):
+def compute_gae(rewards, values, dones, gamma, gae_lambda, ignore_dones: bool = False):
     T, N = rewards.shape
     device = rewards.device
     advantages = torch.zeros_like(rewards)
     lastgaelam = torch.zeros(N, device=device)
     for t in reversed(range(T)):
         if t == T - 1:
-            nextnonterminal = 1.0 - (dones[:, t])
-            nextvalues = values[:, t]  
+            nextvalues = values[:, t]
+            if ignore_dones:
+                nextnonterminal = torch.ones(N, device=device)
+            else:
+                nextnonterminal = 1.0 - (dones[:, t])
         else:
-            nextnonterminal = 1.0 - (dones[:, t+1])
             nextvalues = values[:, t+1]
+            if ignore_dones:
+                nextnonterminal = torch.ones(N, device=device)
+            else:
+                nextnonterminal = 1.0 - (dones[:, t+1])
         delta = rewards[:, t] + gamma * nextvalues * nextnonterminal - values[:,    t]
         lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
         advantages[:, t] = lastgaelam
@@ -372,6 +430,11 @@ if __name__ == '__main__':
     rff_rms = RunningStats()
     # Observation RunningStats for last-frame normalization: shape (H, W, 1)
     ob_rms = RunningStats(shape=(OBS_HEIGHT, OBS_WIDTH, 1), dtype=torch.float32, device=device)
+
+    # Initialize observation normalization parameters using a random agent
+    print("Warming up observation normalization with random policy...")
+    warmup_observation_stats(ob_rms)
+    print("Warmup complete.")
 
     for iter_idx in range(ITERS):
         print(f"\n=== Iteration {iter_idx+1}/{ITERS} ===")
@@ -440,6 +503,17 @@ if __name__ == '__main__':
 
         print(f"Collected {total_episodes} episodes, {frame_counter.get()} frames")
 
+        # Update observation running stats with all last-frames from this rollout
+        # This keeps whitening parameters current before building the training dataset
+        for ep_idx in range(len(rollout_data["obs"])):
+            obss_ep = np.array(rollout_data["obs"][ep_idx], dtype=np.uint8)  # (T, 4, H, W)
+            if obss_ep.shape[0] == 0:
+                continue
+            last_frames = obss_ep[:, -1, :, :]  # (T, H, W) last channel is most recent
+            last_frames_norm = (last_frames.astype(np.float32) / 255.0)
+            batch = torch.tensor(last_frames_norm[..., None], dtype=torch.float32, device=device)  # (T, H, W, 1)
+            ob_rms.update(batch)
+
         # Build reward forward filter over all episodes (scalar running stats)
         filtered_intrinsic_all = []
         for rw_i_ep in rollout_data["rwds_i"]:
@@ -455,7 +529,8 @@ if __name__ == '__main__':
             std_i_running = 1.0
 
         # Per-episode GAE, then flatten transitions to build dataset
-        flat_obs_list = []
+        flat_obs_policy_list = []
+        flat_obs_rnd_list = []
         flat_acts_list = []
         flat_oldlogp_list = []
         flat_adv_list = []
@@ -470,8 +545,12 @@ if __name__ == '__main__':
             T = obss_ep.shape[0]
             if T == 0:
                 continue
-            # Prepare normalized observations for training (N,C,H,W) using last-frame stats
+            # Build two views of observations:
+            # - Policy/value: scaled to [0,1] only (no whitening)
+            # - RND: whitened using running stats and clipped to [-5, 5]
             obs_img = (obss_ep.astype(np.float32) / 255.0)
+            obs_policy_ep = torch.tensor(obs_img, dtype=torch.float32)
+
             _, mean_hw1, std_hw1 = ob_rms.get()
             mean_hw1_t = mean_hw1 if isinstance(mean_hw1, torch.Tensor) else torch.tensor(mean_hw1)
             std_hw1_t = std_hw1 if isinstance(std_hw1, torch.Tensor) else torch.tensor(std_hw1)
@@ -481,7 +560,7 @@ if __name__ == '__main__':
             std_hw = std_hw1_t[..., 0]
             mean_chw = mean_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
             std_chw = std_hw.unsqueeze(0).repeat(OBS_CHANNELS, 1, 1)
-            obs_norm_ep = (torch.tensor(obs_img, dtype=torch.float32) - mean_chw) / std_chw
+            obs_rnd_ep = torch.clamp((torch.tensor(obs_img, dtype=torch.float32) - mean_chw) / std_chw, min=OBS_CLIP_MIN, max=OBS_CLIP_MAX)
             acts_ep = torch.tensor(rollout_data["acts"][ep_idx], dtype=torch.long)
             logps_ep = torch.tensor(rollout_data["logps"][ep_idx], dtype=torch.float32)
             vals_i_ep = torch.tensor(rollout_data["vals_int"][ep_idx], dtype=torch.float32)
@@ -493,11 +572,12 @@ if __name__ == '__main__':
             # normalize intrinsic rewards by running std of filtered intrinsic
             rwds_i_norm_ep = rwds_i_raw_ep / std_i_running
 
-            adv_e_ep, ret_e_ep = compute_gae_1d(rwds_e_ep, vals_e_ep, dones_ep, GAMMA_EXT, GAE_LAMBDA)
-            adv_i_ep, ret_i_ep = compute_gae_1d(rwds_i_norm_ep, vals_i_ep, dones_ep, GAMMA_INT, GAE_LAMBDA)
+            adv_e_ep, ret_e_ep = compute_gae_1d(rwds_e_ep, vals_e_ep, dones_ep, GAMMA_EXT, GAE_LAMBDA, ignore_dones=IGNORE_DONES)
+            adv_i_ep, ret_i_ep = compute_gae_1d(rwds_i_norm_ep, vals_i_ep, dones_ep, GAMMA_INT, GAE_LAMBDA, ignore_dones=IGNORE_DONES)
             adv_total_ep = EXTRINSIC_COEF * adv_e_ep + INTRINSIC_COEF * adv_i_ep
 
-            flat_obs_list.append(obs_norm_ep)
+            flat_obs_policy_list.append(obs_policy_ep)
+            flat_obs_rnd_list.append(obs_rnd_ep)
             flat_acts_list.append(acts_ep)
             flat_oldlogp_list.append(logps_ep)
             flat_adv_list.append(adv_total_ep)
@@ -506,12 +586,13 @@ if __name__ == '__main__':
             flat_rwds_i_norm.extend(rwds_i_norm_ep.tolist())
             flat_rwds_e_raw.extend(rwds_e_ep.tolist())
 
-        if len(flat_obs_list) == 0:
+        if len(flat_obs_policy_list) == 0:
             print("No samples collected; skipping update this iteration.")
             continue
 
         # Concatenate across episodes
-        rollout_obs = torch.cat(flat_obs_list, dim=0).to(device)
+        rollout_obs_policy = torch.cat(flat_obs_policy_list, dim=0).to(device)
+        rollout_obs_rnd = torch.cat(flat_obs_rnd_list, dim=0).to(device)
         rollout_acts = torch.cat(flat_acts_list, dim=0).to(device)
         rollout_logps = torch.cat(flat_oldlogp_list, dim=0).to(device)
         rollout_advs = torch.cat(flat_adv_list, dim=0).to(device)
@@ -521,7 +602,7 @@ if __name__ == '__main__':
         # normalize advantages
         rollout_advs = (rollout_advs - rollout_advs.mean()) / (rollout_advs.std() + 1e-8)
 
-        n_samples = rollout_obs.shape[0]
+        n_samples = rollout_obs_policy.shape[0]
         indices = np.arange(n_samples)
 
         total_pi_loss, total_v_loss, total_v_loss_i, total_v_loss_e, total_ent_loss, total_rnd_loss, n_updates = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -534,7 +615,8 @@ if __name__ == '__main__':
             for start in range(0, n_samples, MINIBATCH_SIZE):
                 end = min(start + MINIBATCH_SIZE, n_samples)
                 mb_idx = indices[start:end]
-                mb_obs = rollout_obs[mb_idx]
+                mb_obs_policy = rollout_obs_policy[mb_idx]
+                mb_obs_rnd = rollout_obs_rnd[mb_idx]
                 mb_acts = rollout_acts[mb_idx]
                 mb_logps = rollout_logps[mb_idx]
                 mb_advs = rollout_advs[mb_idx]
@@ -544,7 +626,8 @@ if __name__ == '__main__':
                 pi_loss, v_loss, v_loss_i, v_loss_e, ent_loss, rnd_loss = ppo_update(
                     agent, 
                     agent_optimizer, 
-                    mb_obs, 
+                    mb_obs_policy,
+                    mb_obs_rnd, 
                     mb_acts, 
                     mb_logps, 
                     mb_advs, 
