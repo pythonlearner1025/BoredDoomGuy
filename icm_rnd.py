@@ -26,6 +26,9 @@ INTRINSIC_COEF, EXTRINSIC_COEF = 0.8, 0.2
 OBS_HEIGHT, OBS_WIDTH = 60, 80
 OBS_CHANNELS = FRAME_STACK
 OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
+OBS_RANDOM_WARMUP_STEPS = 10000
+OBS_CLIP_MIN = -5.0
+OBS_CLIP_MAX = 5.0
 
 MACRO_ACTIONS = [
     [], [vzd.Button.MOVE_FORWARD], [vzd.Button.MOVE_BACKWARD],
@@ -196,7 +199,7 @@ def run_parallel_episodes(n_procs, agent_state_dict, buffer, frame_counter, debu
 
 def ppo_update(agent, optimizer, obs_mb, act_mb, old_logp_mb, adv_mb, ret_int_mb, ret_ext_mb, clip_coef=CLIP_COEF, ent_coef=0.01, vf_coef=VF_COEF):
     adv_mb = (adv_mb - adv_mb.mean()) / (adv_mb.std() + 1e-8)
-    logits, v_int_new, v_ext_new = agent.forward(obs_mb)
+    logits, v_int_new, v_ext_new = agent.forward(obs_policy_mb)
     dist = torch.distributions.Categorical(logits=logits)
     logp_new_mb, entropy, ratio = dist.log_prob(act_mb), dist.entropy().mean(), (dist.log_prob(act_mb) - old_logp_mb).exp()
 
@@ -259,6 +262,11 @@ if __name__ == '__main__':
     agent_optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
     rff_rms = RunningStats()
     ob_rms = RunningStats(shape=(OBS_HEIGHT, OBS_WIDTH, 1), dtype=torch.float32, device=device)
+
+    # Initialize observation normalization parameters using a random agent
+    print("Warming up observation normalization with random policy...")
+    warmup_observation_stats(ob_rms)
+    print("Warmup complete.")
 
     for iter_idx in range(ITERS):
         print(f"\n=== Iteration {iter_idx+1}/{ITERS} ===")
@@ -343,7 +351,8 @@ if __name__ == '__main__':
             std_i_running = 1.0
 
         # Per-episode GAE, then flatten transitions to build dataset
-        flat_obs_list = []
+        flat_obs_policy_list = []
+        flat_obs_rnd_list = []
         flat_acts_list = []
         flat_oldlogp_list = []
         flat_adv_list = []
@@ -358,8 +367,12 @@ if __name__ == '__main__':
             T = obss_ep.shape[0]
             if T == 0:
                 continue
-            # Prepare normalized observations for training (N,C,H,W) using last-frame stats
+            # Build two views of observations:
+            # - Policy/value: scaled to [0,1] only (no whitening)
+            # - RND: whitened using running stats and clipped to [-5, 5]
             obs_img = (obss_ep.astype(np.float32) / 255.0)
+            obs_policy_ep = torch.tensor(obs_img, dtype=torch.float32)
+
             _, mean_hw1, std_hw1 = ob_rms.get()
             mean_hw1_t = mean_hw1 if isinstance(mean_hw1, torch.Tensor) else torch.tensor(mean_hw1, device=device)
             std_hw1_t = std_hw1 if isinstance(std_hw1, torch.Tensor) else torch.tensor(std_hw1, device=device)
@@ -381,11 +394,12 @@ if __name__ == '__main__':
             # normalize intrinsic rewards by running std of filtered intrinsic
             rwds_i_norm_ep = rwds_i_raw_ep / std_i_running
 
-            adv_e_ep, ret_e_ep = compute_gae_1d(rwds_e_ep, vals_e_ep, dones_ep, GAMMA_EXT, GAE_LAMBDA)
-            adv_i_ep, ret_i_ep = compute_gae_1d(rwds_i_norm_ep, vals_i_ep, dones_ep, GAMMA_INT, GAE_LAMBDA)
+            adv_e_ep, ret_e_ep = compute_gae_1d(rwds_e_ep, vals_e_ep, dones_ep, GAMMA_EXT, GAE_LAMBDA, ignore_dones=IGNORE_DONES)
+            adv_i_ep, ret_i_ep = compute_gae_1d(rwds_i_norm_ep, vals_i_ep, dones_ep, GAMMA_INT, GAE_LAMBDA, ignore_dones=IGNORE_DONES)
             adv_total_ep = EXTRINSIC_COEF * adv_e_ep + INTRINSIC_COEF * adv_i_ep
 
-            flat_obs_list.append(obs_norm_ep)
+            flat_obs_policy_list.append(obs_policy_ep)
+            flat_obs_rnd_list.append(obs_rnd_ep)
             flat_acts_list.append(acts_ep)
             flat_oldlogp_list.append(logps_ep)
             flat_adv_list.append(adv_total_ep)
@@ -394,12 +408,13 @@ if __name__ == '__main__':
             flat_rwds_i_norm.extend(rwds_i_norm_ep.tolist())
             flat_rwds_e_raw.extend(rwds_e_ep.tolist())
 
-        if len(flat_obs_list) == 0:
+        if len(flat_obs_policy_list) == 0:
             print("No samples collected; skipping update this iteration.")
             continue
 
         # Concatenate across episodes
-        rollout_obs = torch.cat(flat_obs_list, dim=0).to(device)
+        rollout_obs_policy = torch.cat(flat_obs_policy_list, dim=0).to(device)
+        rollout_obs_rnd = torch.cat(flat_obs_rnd_list, dim=0).to(device)
         rollout_acts = torch.cat(flat_acts_list, dim=0).to(device)
         rollout_logps = torch.cat(flat_oldlogp_list, dim=0).to(device)
         rollout_advs = torch.cat(flat_adv_list, dim=0).to(device)
@@ -409,7 +424,7 @@ if __name__ == '__main__':
         # normalize advantages
         rollout_advs = (rollout_advs - rollout_advs.mean()) / (rollout_advs.std() + 1e-8)
 
-        n_samples = rollout_obs.shape[0]
+        n_samples = rollout_obs_policy.shape[0]
         indices = np.arange(n_samples)
 
         total_pi_loss, total_v_loss, total_v_loss_i, total_v_loss_e, total_ent_loss, total_rnd_loss, n_updates = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -425,7 +440,8 @@ if __name__ == '__main__':
             for start in range(0, n_samples, MINIBATCH_SIZE):
                 end = min(start + MINIBATCH_SIZE, n_samples)
                 mb_idx = indices[start:end]
-                mb_obs = rollout_obs[mb_idx]
+                mb_obs_policy = rollout_obs_policy[mb_idx]
+                mb_obs_rnd = rollout_obs_rnd[mb_idx]
                 mb_acts = rollout_acts[mb_idx]
                 mb_logps = rollout_logps[mb_idx]
                 mb_advs = rollout_advs[mb_idx]
@@ -435,7 +451,8 @@ if __name__ == '__main__':
                 pi_loss, v_loss, v_loss_i, v_loss_e, ent_loss, rnd_loss = ppo_update(
                     agent, 
                     agent_optimizer, 
-                    mb_obs, 
+                    mb_obs_policy,
+                    mb_obs_rnd, 
                     mb_acts, 
                     mb_logps, 
                     mb_advs, 
