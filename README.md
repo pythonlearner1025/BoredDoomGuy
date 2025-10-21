@@ -1,4 +1,6 @@
-# Doom Curiosity Playground [WIP] 
+# Can Curiosity Driven Agents Play Doom? 
+
+My effort to get a curiosity driven agent to complete Doom E1M1 level "The Hangar" 
 
 ## 1. Install & Run 
 
@@ -142,10 +144,14 @@ err_loss = F.mse_loss(eps_pred, torch.log(eps_b + EPSILON_CLAMP))
 - [e0ee62b](https://github.com/pythonlearner1025/BoredDoomGuy/tree/e0ee62bbf3801535a81fb67de552775668b8a634): 
     - Total mean rwd dips down from 1 and and plateus around 1e-3 (iter 30). Intrinsic rwd identical to total mean rwd graph, per-iter mean extrinsic more noisy but oscillates around 1e-3 with around 0.018 std, while the running average shows the same story.  
     - Forwad dynamics error is extremely small (starts 4e-4 and approaches 1e-5 by iter 30), suggesting RandomEncoder destroys visual differences in obs during encoding   
+- [ad61d92](https://github.com/pythonlearner1025/BoredDoomGuy/tree/ad61d92db335c3f47582ac28a72a787239281aa9): 
+    - This is an implementation of OpenAI's [Random Network Distillation](https://openai.com/index/reinforcement-learning-with-prediction-based-rewards/) work
+    - Empirically, with INTRINSIC_COEF=EXTRINSIC_COEF=0.5, it was the only implementation out of ICM (Pathak et al, 2017) and LPM (Hou et al, 2025) that didn't asymptotically converge to zero reward. 
+    - However, intrinsic reward collapses to zero early on and the policy is updated only by extrinsic rewards - i.e. it behaves no differently than a PPO agent with reward scaled by half. 
+    - I am setting EXTRINSIC_COEF=1.0 to investigate if purely curiosity driven agent can gain external rewards + exhibit complex behavior (kills enemies, finds secret room, completes level) 
 
 ## 7. TODOs for future revision
 
-- [ ] Implement Random Network Distillation, OpenAI's solution
-
-- [ ] Add diagrams / reward curves once experiments stabilise.
+- [X] Implement Learning Progress Monitoring, a 2025 paper solution to Noisy Tv Problem. Does it work? No, converges to no action
+- [X] Implement Random Network Distillation, OpenAI's solution. Does it work? No, extrinsic reward dominates policy.
 - [ ] Document best-known hyperparameter tweaks for Doom E1M1.
