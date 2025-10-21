@@ -56,6 +56,7 @@ Following Burda et al., the death-to-respawn transition is treated as just anoth
 | -------------- | --------- | ---- |
 | `icm.py`       |  Large Scale Curiosity Driven Learning | https://arxiv.org/pdf/1808.04355 |
 | `icm_lpm.py`   | Beyond Noisy TVs: Noise-Robust Exploration via Learning Progress Monitoring | https://arxiv.org/pdf/2509.25438v1 |
+| `icm_rnd.py`   | Exploration by Random Network Distillation | https://arxiv.org/pdf/1810.12894 |
 
 ## 4. `icm.py` – Intrinsic Curiosity Module
 
@@ -138,6 +139,14 @@ eps_pred = error_model(phi_obs, act_onehot)
 
 err_loss = F.mse_loss(eps_pred, torch.log(eps_b + EPSILON_CLAMP))
 ```
+
+## 6. `icm_rnd.py` - Exploration by Random Network Distillation
+
+This paper is surprisingly similar to Learning Progress Monitoring, except for several key differences:
+- removes forward dynamics model with frozen random network
+- intrinsic reward is difference between random network embedding of observation and prediction network embedding of observation. roughly the relationship between the random network and prediction network is teacher-student, hence the title. training samples for student network are not delayed by one iteration like in LPM. 
+- use two separate value heads, one for intrinsic and one for extrinsic rewards  
+- keep track of running mean and variance of observations and use it to normalize observations for random network and prediction networks. 
 
 ### Empirical Observations 
 
