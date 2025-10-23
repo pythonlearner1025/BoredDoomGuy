@@ -24,8 +24,8 @@ from transformers import CLIPTokenizer, CLIPTextModel
 @dataclass
 class DoomSimCfg:
     n_hist: int = 64
-    alpha_max: float = 0.25
-    k_buckets: int = 8
+    alpha_max: float = 0.7
+    k_buckets: int = 10
     cfg_weight: float = 1.5
     num_inference_steps: int = 4
     text_hidden_size: int = 768
@@ -48,6 +48,7 @@ class DoomSimCfg:
     height: int = 120
     width: int = 160
     use_xpred: bool = True  # X-prediction (sample) vs epsilon (noise) prediction
+    context_dropout_prob: float = 0.1  # Probability of dropping context frames during training for CFG
 
 VALID_ACTIONS = [
     "MOVE_FORWARD",
@@ -453,18 +454,36 @@ def encode_images_to_latents(vae: AutoencoderKL, images: torch.Tensor, scaling_f
     images = images.to(device=vae.device, dtype=next(vae.parameters()).dtype)
     return vae.encode(images).latent_dist.sample() * scaling_factor
 
-def cfg_only_on_observation(unet, x_in, t, enc_states, obs_mask, timestep_cond, cfg_weight):
-    model_dtype = next(unet.parameters()).dtype
-    x_in, enc_states, timestep_cond = x_in.to(dtype=model_dtype), enc_states.to(dtype=model_dtype), timestep_cond.to(dtype=model_dtype)
+def cfg_with_context_dropout(unet, x_noisy, context_latents, t, enc_states, timestep_cond, cfg_weight):
+    """
+    Apply Classifier-Free Guidance by running the model twice:
+    1. With context latents (conditional)
+    2. Without context latents (unconditional - zeros)
     
-    enc_uncond = enc_states.clone()
-    enc_uncond[obs_mask] = 0.0
-    enc_cat = torch.cat([enc_uncond, enc_states], dim=0)
-    x_cat, t_cat, cond_cat = torch.cat([x_in, x_in], dim=0), torch.cat([t, t], dim=0), torch.cat([timestep_cond, timestep_cond], dim=0)
+    This matches the paper's approach of dropping context frames with probability 0.1 during training
+    and using CFG at inference time.
+    """
+    model_dtype = next(unet.parameters()).dtype
+    B = x_noisy.shape[0]
+    
+    # Conditional: use actual context
+    x_cond = torch.cat([x_noisy, context_latents.flatten(1, 2)], dim=1).to(dtype=model_dtype)
+    
+    # Unconditional: use zero context (simulating context dropout)
+    context_uncond = torch.zeros_like(context_latents)
+    x_uncond = torch.cat([x_noisy, context_uncond.flatten(1, 2)], dim=1).to(dtype=model_dtype)
+    
+    # Run both through the model in a single batch for efficiency
+    x_cat = torch.cat([x_uncond, x_cond], dim=0)
+    t_cat = torch.cat([t, t], dim=0)
+    enc_cat = torch.cat([enc_states, enc_states], dim=0).to(dtype=model_dtype)
+    cond_cat = torch.cat([timestep_cond, timestep_cond], dim=0).to(dtype=model_dtype)
     
     out = unet(sample=x_cat, timestep=t_cat, encoder_hidden_states=enc_cat, timestep_cond=cond_cat).sample
-    eps_uncond, eps_cond = out.chunk(2, dim=0)
-    return eps_uncond + cfg_weight * (eps_cond - eps_uncond)
+    pred_uncond, pred_cond = out.chunk(2, dim=0)
+    
+    # Blend predictions using CFG weight
+    return pred_uncond + cfg_weight * (pred_cond - pred_uncond)
 
 def create_rollout_comparison_grid(epoch_dir: str, n_context: int, n_rollout: int):
     try:
@@ -553,14 +572,18 @@ def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer,
     alpha = torch.rand(B, device=device) * cfg.alpha_max
     ctxt_noisy = ctxt + alpha.view(B, 1, 1, 1, 1) * torch.randn_like(ctxt, dtype=ctxt.dtype)
     bucket_ids = noise_bucketer.bucketize(alpha)
-
-    x_in = torch.cat([x_t, ctxt_noisy.flatten(1, 2)], dim=1)
+    
+    # Context dropout: randomly zero out context LATENTS for CFG training
+    # This teaches the model to work both with and without context
+    if random.random() < cfg.context_dropout_prob:
+        ctxt_noisy = torch.zeros_like(ctxt_noisy)
 
     caption_embeds = caption_encoder(captions) if caption_encoder and captions else None
     action_text_embeds, obs_mask = conditioner(actions, caption_embeds)
     timestep_cond = noise_bucketer(bucket_ids)
 
-    model_output = cfg_only_on_observation(unet, x_in, timesteps, action_text_embeds, obs_mask, timestep_cond, cfg.cfg_weight)
+    # Use CFG with context dropout (runs model with and without context, blends results)
+    model_output = cfg_with_context_dropout(unet, x_t, ctxt_noisy, timesteps, action_text_embeds, timestep_cond, cfg.cfg_weight)
     
     if cfg.use_xpred:
         # X-prediction objective: model directly predicts clean latent x0
@@ -569,7 +592,7 @@ def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer,
         # Epsilon-prediction objective: model predicts noise
         return F.mse_loss(model_output, noise)
 
-def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10, lr: float = 1e-4, use_xpred: bool = True, preload_to_ram: bool = False, rollout_interval: int = 1):
+def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 10000, lr: float = 1e-4, use_xpred: bool = True, preload_to_ram: bool = False, rollout_interval: int = 100):
     cfg = DoomSimCfg()
     cfg.use_xpred = use_xpred
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
@@ -583,11 +606,12 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
         config={
             "learning_rate": lr,
             "batch_size": batch_size,
-            "num_epochs": num_epochs,
+            "num_steps": num_steps,
             "n_hist": cfg.n_hist,
             "alpha_max": cfg.alpha_max,
             "k_buckets": cfg.k_buckets,
             "cfg_weight": cfg.cfg_weight,
+            "context_dropout_prob": cfg.context_dropout_prob,
             "num_inference_steps": cfg.num_inference_steps,
             "lora_r": cfg.lora_r,
             "lora_alpha": cfg.lora_alpha,
@@ -615,15 +639,9 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
     
     model_dtype = next(unet.parameters()).dtype
     
-    print(f"Dataset: {len(train_dataset)} episodes")
-    
     optimizer = torch.optim.AdamW(
         list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()), lr=lr
     )
-    
-    # Cosine annealing LR scheduler
-    scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=lr * 0.01)
-    print(f"Using CosineAnnealingLR: initial_lr={lr}, eta_min={lr * 0.01}, T_max={num_epochs}")
     
     rollout_steps = 8
     test_frames, test_actions = train_dataset.load_episode_frames(idx=0, n_frames=cfg.n_hist + rollout_steps, start_idx=0)
@@ -633,41 +651,66 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
     
     rollout_dir = f"debug/rollouts/{timestamp}"
     os.makedirs(rollout_dir, exist_ok=True)
-    print(f"Rollouts will be saved to: {rollout_dir}")
-    print(f"Rollout interval: every {rollout_interval} epoch(s)")
     
-    for epoch in range(num_epochs):
-        total_loss = 0.0
-        for batch_idx, (frames, actions) in enumerate(train_loader):
-            frames, actions = frames.to(device=device, dtype=model_dtype), actions.to(device=device, dtype=model_dtype)
-            past_images, current_images, past_actions = frames[:, :-1], frames[:, -1], actions[:, :-1]
-            
-            loss = train_step_teacher_forced(
-                vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder,
-                cfg, past_images, past_actions, current_images, captions=None
-            )
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()),
-                cfg.grad_clip
-            )
-            optimizer.step()
-            
-            total_loss += loss.item()
-            if batch_idx % 10 == 0:
-                print(f"[{epoch+1}/{num_epochs}] Batch [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
-                wandb.log({"batch_loss": loss.item(), "epoch": epoch + 1, "batch": batch_idx})
+    print("\n" + "="*60)
+    print("TRAINING CONFIGURATION")
+    print("="*60)
+    print(f"Dataset: {len(train_dataset)} episodes")
+    print(f"Batch size: {batch_size}")
+    print(f"Total training steps: {num_steps}")
+    print(f"Learning rate: {lr} (constant)")
+    print(f"Context length (n_hist): {cfg.n_hist}")
+    print(f"Context dropout probability: {cfg.context_dropout_prob}")
+    print(f"Noise augmentation: alpha_max={cfg.alpha_max}, buckets={cfg.k_buckets}")
+    print(f"CFG weight: {cfg.cfg_weight}")
+    print(f"Prediction type: {'X-prediction (sample)' if cfg.use_xpred else 'Epsilon-prediction (noise)'}")
+    print(f"Rollout interval: every {rollout_interval} step(s)")
+    print(f"Checkpoint save interval: every 1000 steps")
+    print(f"Rollouts directory: {rollout_dir}")
+    print("="*60 + "\n")
+    
+    # Create infinite data iterator
+    from itertools import cycle
+    data_iter = cycle(train_loader)
+    
+    global_step = 0
+    running_loss = 0.0
+    log_interval = 10
+    
+    print(f"\nStarting training for {num_steps} steps...")
+    
+    while global_step < num_steps:
+        frames, actions = next(data_iter)
+        frames, actions = frames.to(device=device, dtype=model_dtype), actions.to(device=device, dtype=model_dtype)
+        past_images, current_images, past_actions = frames[:, :-1], frames[:, -1], actions[:, :-1]
         
-        avg_loss = total_loss / len(train_loader)
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"[{epoch+1}/{num_epochs}] Average Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
-        wandb.log({"epoch_loss": avg_loss, "learning_rate": current_lr, "epoch": epoch + 1})
+        loss = train_step_teacher_forced(
+            vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder,
+            cfg, past_images, past_actions, current_images, captions=None
+        )
+        
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()),
+            cfg.grad_clip
+        )
+        optimizer.step()
+        
+        global_step += 1
+        running_loss += loss.item()
+        
+        # Log every N steps
+        if global_step % log_interval == 0:
+            avg_loss = running_loss / log_interval
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"[Step {global_step}/{num_steps}] Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
+            wandb.log({"loss": avg_loss, "learning_rate": current_lr, "step": global_step})
+            running_loss = 0.0
         
         # Run rollout at specified intervals
-        if (epoch + 1) % rollout_interval == 0:
-            print(f"\nRunning rollout for epoch {epoch+1}...")
+        if global_step % rollout_interval == 0:
+            print(f"\nRunning rollout at step {global_step}...")
             unet.eval()
             conditioner.eval()
             noise_bucketer.eval()
@@ -692,9 +735,8 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
                     scheduler.set_timesteps(cfg.num_inference_steps, device=device)
                     
                     for t in scheduler.timesteps:
-                        x_in = torch.cat([lat, ctx.flatten(1, 2)], dim=1)
-                        x0_pred = cfg_only_on_observation(
-                            unet, x_in, t.expand(1), action_text_embeds, obs_mask, timestep_cond, cfg.cfg_weight
+                        x0_pred = cfg_with_context_dropout(
+                            unet, lat, ctx, t.expand(1), action_text_embeds, timestep_cond, cfg.cfg_weight
                         )
                         lat = scheduler.step(x0_pred, t, lat).prev_sample
                     
@@ -702,40 +744,36 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
                     predicted_frames.append(next_frame)
                     current_context = torch.cat([current_context[:, 1:], next_frame.unsqueeze(1)], dim=1)
                 
-                epoch_dir = os.path.join(rollout_dir, f"epoch_{epoch+1:03d}")
-                os.makedirs(epoch_dir, exist_ok=True)
+                step_dir = os.path.join(rollout_dir, f"step_{global_step:06d}")
+                os.makedirs(step_dir, exist_ok=True)
                 
                 for i in range(cfg.n_hist):
                     frame = (test_context[0, i].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-                    Image.fromarray(frame).save(os.path.join(epoch_dir, f"context_{i:02d}.png"))
+                    Image.fromarray(frame).save(os.path.join(step_dir, f"context_{i:02d}.png"))
                 
                 for i, frame in enumerate(predicted_frames):
                     frame_np = (frame[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-                    Image.fromarray(frame_np).save(os.path.join(epoch_dir, f"pred_{i:02d}.png"))
+                    Image.fromarray(frame_np).save(os.path.join(step_dir, f"pred_{i:02d}.png"))
                 
                 for i in range(rollout_steps):
                     frame = (test_gt_frames[0, i].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-                    Image.fromarray(frame).save(os.path.join(epoch_dir, f"gt_{i:02d}.png"))
+                    Image.fromarray(frame).save(os.path.join(step_dir, f"gt_{i:02d}.png"))
                 
-                create_rollout_comparison_grid(epoch_dir, cfg.n_hist, rollout_steps)
-                print(f"Rollout saved to: {epoch_dir}")
+                create_rollout_comparison_grid(step_dir, cfg.n_hist, rollout_steps)
+                print(f"Rollout saved to: {step_dir}")
+            
+            unet.train()
+            conditioner.train()
+            noise_bucketer.train()
         
-        # Save checkpoint every 100 epochs
-        if (epoch + 1) % 100 == 0:
-            if cfg.use_lora:
-                ckpt_dir = f"checkpoints/doom_lora/{timestamp}/epoch_{epoch+1:04d}"
-                os.makedirs(ckpt_dir, exist_ok=True)
-                unet.save_pretrained(f"{ckpt_dir}/unet")
-                conditioner.save_pretrained(f"{ckpt_dir}/conditioner")
-                noise_bucketer.save_pretrained(f"{ckpt_dir}/noise_bucketer")
-                print(f"✓ Checkpoint saved at epoch {epoch+1}: {ckpt_dir}/")
-        
-        unet.train()
-        conditioner.train()
-        noise_bucketer.train()
-        
-        # Step the learning rate scheduler
-        scheduler_lr.step()
+        # Save checkpoint every 1000 steps
+        if global_step % 1000 == 0 and cfg.use_lora:
+            ckpt_dir = f"checkpoints/doom_lora/{timestamp}/step_{global_step:06d}"
+            os.makedirs(ckpt_dir, exist_ok=True)
+            unet.save_pretrained(f"{ckpt_dir}/unet")
+            conditioner.save_pretrained(f"{ckpt_dir}/conditioner")
+            noise_bucketer.save_pretrained(f"{ckpt_dir}/noise_bucketer")
+            print(f"✓ Checkpoint saved at step {global_step}: {ckpt_dir}/")
     
     # Save final checkpoint
     if cfg.use_lora:
@@ -790,16 +828,12 @@ def rollout(
         scheduler.set_timesteps(cfg.num_inference_steps, device=device)
 
         for t in scheduler.timesteps:
-            # Channel concat
-            ctx_cat = ctx.flatten(1,2)
-            x_in = torch.cat([lat, ctx_cat], dim=1)
-            
-            x0_pred = cfg_only_on_observation(
+            x0_pred = cfg_with_context_dropout(
                 unet, 
-                x_in, 
+                lat, 
+                ctx,
                 t.expand(B), 
                 action_text_embeds, 
-                obs_mask, 
                 timestep_cond, 
                 cfg.cfg_weight
             )
@@ -817,12 +851,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Doom world model with diffusion + LoRA")
     parser.add_argument("--data_dir", type=str, default="debug/rnd/20251023_014026", help="Path to episode data directory")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size (use 2 for MPS, 4+ for CUDA)")
-    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--steps", type=int, default=10000, help="Number of training steps (paper uses 700,000)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (paper uses 2e-5)")
     parser.add_argument("--xpred", type=lambda x: x.lower() == 'true', default=True, help="Use X-prediction (sample) if True, else epsilon (noise) prediction (default: True)")
     parser.add_argument("--preload", action="store_true", help="Preload all data to RAM (default: False, load on-demand from disk)")
-    parser.add_argument("--rollout_interval", type=int, default=1, help="Run rollout every N epochs (default: 1, every epoch)")
+    parser.add_argument("--rollout_interval", type=int, default=100, help="Run rollout every N steps (default: 100)")
     args = parser.parse_args()
     
-    train(data_dir=args.data_dir, batch_size=args.batch_size, num_epochs=args.epochs, lr=args.lr, use_xpred=args.xpred, preload_to_ram=args.preload, rollout_interval=args.rollout_interval)
+    train(data_dir=args.data_dir, batch_size=args.batch_size, num_steps=args.steps, lr=args.lr, use_xpred=args.xpred, preload_to_ram=args.preload, rollout_interval=args.rollout_interval)
 
