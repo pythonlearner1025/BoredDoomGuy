@@ -9,6 +9,7 @@ agent_playback/
 checkpoints/
 _vizdoom.ini
 vae_*
+*.pdf
 
 *.DS_Store
 
