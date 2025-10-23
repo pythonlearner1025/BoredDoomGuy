@@ -14,14 +14,14 @@ from model import RNDAgent, RunningStats
 
 ITERS, EPOCHS = 1000, 2
 FRAME_SKIP, FRAME_STACK = 4, 4
-MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(1e4)
-MAX_FRAMES_PER_EPISODE = int(37.5*60*1)
+MAX_ROLLOUT_FRAMES = FRAME_SKIP * int(4e4)
+MAX_FRAMES_PER_EPISODE = int(37.5*60*5)
 
 CLIP_COEF, VF_COEF, MAX_GRAD_NORM = 0.1, 0.5, 1.0
 ENT_COEF_START, ENT_COEF_END = 0.10, 0.001
 MINIBATCH_SIZE, LEARNING_RATE = 2048, 1e-4
 GAMMA_INT, GAMMA_EXT, GAE_LAMBDA = 0.99, 0.999, 0.95
-INTRINSIC_COEF, EXTRINSIC_COEF = 0.8, 0.2
+INTRINSIC_COEF, EXTRINSIC_COEF = 0.0, 1.0
 IGNORE_DONES = True
 
 OBS_HEIGHT, OBS_WIDTH = 60, 80
@@ -30,6 +30,9 @@ OBS_SIZE = OBS_CHANNELS * OBS_HEIGHT * OBS_WIDTH
 OBS_RANDOM_WARMUP_STEPS = 10000
 OBS_CLIP_MIN, OBS_CLIP_MAX = -5.0, 5.0
 
+# Optional: cell size for "new area" detection in Doom map units
+NEW_AREA_CELL_SIZE = 128  # >=64 is reasonable; larger => sparser "area" grid
+
 MACRO_ACTIONS = [
     [], [vzd.Button.MOVE_FORWARD], [vzd.Button.MOVE_BACKWARD],
     [vzd.Button.TURN_LEFT], [vzd.Button.TURN_RIGHT],
@@ -37,8 +40,6 @@ MACRO_ACTIONS = [
     [vzd.Button.MOVE_FORWARD, vzd.Button.TURN_RIGHT],
     [vzd.Button.ATTACK], [vzd.Button.USE],
     [vzd.Button.MOVE_FORWARD, vzd.Button.ATTACK],
-    [vzd.Button.MOVE_LEFT, vzd.Button.ATTACK],
-    [vzd.Button.MOVE_RIGHT, vzd.Button.ATTACK],
     [vzd.Button.MOVE_LEFT], [vzd.Button.MOVE_RIGHT],
 ]
 
@@ -111,8 +112,244 @@ def setup_game():
     game.init()
     return game
 
+# =========================
+# Reward shaping utilities
+# =========================
+
+def new_area_reward(curr_pos_xy, visited_cells, last_new_cell, cell_size=NEW_AREA_CELL_SIZE):
+    """
+    Compute the "new area" reward.
+    If current (x, y) falls into an unvisited grid-cell, reward = 20 * (1 + 0.5 * L1_distance)
+    where L1_distance is between this new cell and the last newly discovered cell.
+    Returns (reward, new_last_new_cell).
+    """
+    if curr_pos_xy is None:
+        return 0.0, last_new_cell
+
+    x, y = curr_pos_xy
+    # floor-div handles negative map coords
+    cell = (int(math.floor(x / cell_size)), int(math.floor(y / cell_size)))
+    if cell in visited_cells:
+        return 0.0, last_new_cell
+
+    visited_cells.add(cell)
+    if last_new_cell is None:
+        dist = 0
+    else:
+        dist = abs(cell[0] - last_new_cell[0]) + abs(cell[1] - last_new_cell[1])
+    reward = 20.0 * (1.0 + 0.5 * dist)
+    return reward, cell
+
+class GDMRewardShaper:
+    """
+    Implements the DOOM-specific reward function:
+      1) Player hit: -100
+      2) Player death: -5000
+      3) Enemy hit: +300
+      4) Enemy kill: +1000
+      5) Item/weapon pick up: +100
+      6) Secret found: +500
+      7) New area: 20 * (1 + 0.5 * L1 distance)
+      8) Health delta: 10 * delta
+      9) Armor delta: 10 * delta
+     10) Ammo delta: 10 * max(0, delta) + min(0, delta)
+    """
+    def __init__(self, var_idx_map, cell_size=NEW_AREA_CELL_SIZE):
+        self.var_idx = var_idx_map  # {name -> index in state.game_variables}
+        # Prefer weapon-specific ammo if available; fallback to AMMO1
+        self.ammo_var = 'SELECTED_WEAPON_AMMO' if 'SELECTED_WEAPON_AMMO' in self.var_idx else ('AMMO1' if 'AMMO1' in self.var_idx else None)
+        self.cell_size = cell_size
+        self.visited_cells = set()
+        self.last_new_cell = None
+
+    def reset(self):
+        self.visited_cells.clear()
+        self.last_new_cell = None
+
+    def _gv(self, state, name):
+        """Get a game variable by name from state using self.var_idx; None-safe."""
+        if state is None:
+            return None
+        idx = self.var_idx.get(name, None)
+        if idx is None:
+            return None
+        arr = state.game_variables
+        if idx >= len(arr):
+            return None
+        return float(arr[idx])
+
+    def _ammo(self, state):
+        if self.ammo_var is None:
+            return None
+        val = self._gv(state, self.ammo_var)
+        # ViZDoom uses -1 for "no ammo" in SELECTED_WEAPON_AMMO; treat as 0 for deltas
+        if val is None:
+            return None
+        if self.ammo_var == 'SELECTED_WEAPON_AMMO' and val < 0:
+            return 0.0
+        return val
+
+    def _player_xy_from_labels(self, state):
+        """Prefer object labels for position as requested; fallback to POSITION_X/Y if needed."""
+        if state is None:
+            return None
+        try:
+            for label in state.labels:
+                if getattr(label, "object_name", "") == "DoomPlayer":
+                    return (
+                        float(getattr(label, "object_position_x", None)),
+                        float(getattr(label, "object_position_y", None)),
+                    )
+        except Exception:
+            pass
+        # Fallback: use POSITION_X/Y if available
+        x = self._gv(state, 'POSITION_X')
+        y = self._gv(state, 'POSITION_Y')
+        if x is not None and y is not None:
+            return (x, y)
+        return None
+
+    def compute(self, prev_state, curr_state, game, done_flag=False):
+        # Gather current and previous values
+        ph = self._gv(prev_state, 'HEALTH'); ch = self._gv(curr_state, 'HEALTH')
+        pa = self._gv(prev_state, 'ARMOR');  ca = self._gv(curr_state, 'ARMOR')
+
+        pam = self._ammo(prev_state);       cam = self._ammo(curr_state)
+
+        pk = self._gv(prev_state, 'KILLCOUNT'); ck = self._gv(curr_state, 'KILLCOUNT')
+        pi = self._gv(prev_state, 'ITEMCOUNT'); ci = self._gv(curr_state, 'ITEMCOUNT')
+        ps = self._gv(prev_state, 'SECRETCOUNT'); cs = self._gv(curr_state, 'SECRETCOUNT')
+
+        # Player received damage this step?
+        pdmg = self._gv(prev_state, 'DAMAGECOUNT'); cdmg = self._gv(curr_state, 'DAMAGECOUNT')
+        # Player inflicted an enemy hit this step?
+        phit = self._gv(prev_state, 'HITCOUNT');    chit = self._gv(curr_state, 'HITCOUNT')
+
+        # Deltas (None -> 0.0)
+        dH  = 0.0 if (ph is None or ch is None) else (ch - ph)
+        dA  = 0.0 if (pa is None or ca is None) else (ca - pa)
+        dAm = 0.0 if (pam is None or cam is None) else (cam - pam)
+        dK  = 0.0 if (pk  is None or ck  is None) else (ck - pk)
+        dI  = 0.0 if (pi  is None or ci  is None) else (ci - pi)
+        dS  = 0.0 if (ps  is None or cs  is None) else (cs - ps)
+        dDMG= 0.0 if (pdmg is None or cdmg is None) else (cdmg - pdmg)
+        dHit= 0.0 if (phit is None or chit is None) else (chit - phit)
+
+        reward = 0.0
+
+        # 1) Player hit
+        if (dH < 0) or (dA < 0) or (dDMG > 0):
+            reward += -100.0
+
+        # 2) Player death (apply once, when transitioning alive->dead)
+        died = False
+        prev_alive = (ph is None or ph > 0)
+        curr_dead  = ((ch is not None and ch <= 0) or (hasattr(game, "is_player_dead") and game.is_player_dead()))
+        if prev_alive and curr_dead:
+            died = True
+        if died:
+            reward += -5000.0
+
+        # 3) Enemy hit
+        if dHit > 0:
+            reward += 300.0 * dHit
+
+        # 4) Enemy kill
+        if dK > 0:
+            reward += 1000.0 * dK
+
+        # 5) Item/weapon pickup
+        if dI > 0:
+            reward += 100.0 * dI
+
+        # 6) Secret found
+        if dS > 0:
+            reward += 500.0 * dS
+
+        # 7) New area
+        curr_xy = self._player_xy_from_labels(curr_state)
+        area_rwd, self.last_new_cell = new_area_reward(curr_xy, self.visited_cells, self.last_new_cell, self.cell_size)
+        reward += area_rwd
+
+        # 8) Health delta
+        reward += 10.0 * dH
+
+        # 9) Armor delta
+        reward += 10.0 * dA
+
+        # 10) Ammo delta
+        if not (pam is None or cam is None):
+            reward += 10.0 * max(0.0, dAm) + min(0.0, dAm)
+
+        return float(reward)
+
 def setup_game_gdm_style():
-    pass
+    """
+    Configure game to expose the variables/labels needed and zero out built-in rewards.
+    Returns (game, reward_shaper).
+    """
+    game = vzd.DoomGame()
+    wad_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Doom1.WAD")
+    game.set_doom_game_path(wad_path)
+    game.set_doom_map("E1M1")
+
+    # Disable engine reward shaping; we provide our own
+    def _safe_set(name, val):
+        fn = getattr(game, f"set_{name}_reward", None)
+        if callable(fn):
+            fn(val)
+    for name in ["living", "death", "kill", "item", "secret", "map_exit", "frag", "suicide"]:
+        _safe_set(name, 0.0)
+
+    # Render / input config
+    game.set_render_hud(False)
+    game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
+    game.set_window_visible(False)
+    game.set_mode(vzd.Mode.PLAYER)
+    game.add_game_args("+freelook 1")
+
+    # We need object labels to find the "DoomPlayer" world position
+    game.set_objects_info_enabled(True)
+
+    # Buttons available
+    game.set_available_buttons(BUTTONS_ORDER)
+
+    # Add game variables required for reward shaping (order matters!)
+    var_order = []
+    def add_var(var_name):
+        if hasattr(vzd.GameVariable, var_name):
+            game.add_available_game_variable(getattr(vzd.GameVariable, var_name))
+            var_order.append(var_name)
+
+    # Core stats
+    add_var('HEALTH')
+    add_var('ARMOR')
+
+    # Ammo: prefer SELECTED_WEAPON_AMMO (works across weapons), also add AMMO1 as fallback
+    add_var('SELECTED_WEAPON_AMMO')
+    add_var('AMMO1')
+
+    # Counts used for event detection
+    add_var('KILLCOUNT')
+    add_var('ITEMCOUNT')
+    add_var('SECRETCOUNT')
+
+    # Damage received (player being hit)
+    add_var('DAMAGECOUNT')
+
+    # Enemy hit counter may not exist in all builds; add if present
+    if hasattr(vzd.GameVariable, 'HITCOUNT'):
+        add_var('HITCOUNT')
+
+    # Optional fallback for position if labels fail
+    add_var('POSITION_X')
+    add_var('POSITION_Y')
+
+    game.init()
+
+    var_idx_map = {name: idx for idx, name in enumerate(var_order)}
+    reward_shaper = GDMRewardShaper(var_idx_map, cell_size=NEW_AREA_CELL_SIZE)
+    return game, reward_shaper
 
 def normalize_obs(obs, ob_rms, device):
     obs_t = torch.tensor(obs.astype(np.float32) / 255.0, dtype=torch.float32, device=device).unsqueeze(0)
@@ -135,24 +372,34 @@ def run_episode(process_id, agent_state_dict, buffer, frame_counter, save_rgb_de
         ob_rms = RunningStats(shape=(OBS_HEIGHT, OBS_WIDTH, 1), dtype=torch.float32, device=device)
         ob_rms.count, ob_rms.mean, ob_rms.var = ob_rms_data
     
-    game = setup_game()
+    # Use GDM-style game (custom reward shaping)
+    game, rewarder = setup_game_gdm_style()
     game.new_episode()
+    rewarder.reset()
 
     obss, acts, logps, vals_int, vals_ext, rwds_e, dones = [], [], [], [], [], [], []
     obss_rgb = [] if save_rgb_debug else None
     frame_buffer, frames_collected = [], 0
     timings = {k: [] for k in ['state_get', 'frame_stack', 'obs_norm', 'agent_fwd', 'action_prep', 'env_step', 'data_collect']}
 
+    prev_state_for_reward = None
+
     while frames_collected < MAX_FRAMES_PER_EPISODE:
         if game.is_episode_finished():
             game.new_episode()
+            rewarder.reset()
             frame_buffer = []
+            prev_state_for_reward = None
             continue
 
         t0, state = time.time(), game.get_state()
         if state is None:
             continue
         timings['state_get'].append(time.time() - t0)
+
+        # Keep prev_state for reward deltas
+        if prev_state_for_reward is None:
+            prev_state_for_reward = state
 
         t0 = time.time()
         raw_frame = state.screen_buffer
@@ -172,8 +419,14 @@ def run_episode(process_id, agent_state_dict, buffer, frame_counter, save_rgb_de
         action_vector = [btn in MACRO_ACTIONS[act_idx] for btn in BUTTONS_ORDER]
         timings['action_prep'].append(time.time() - t0)
         
-        t0, rwd_e = time.time(), game.make_action(action_vector, FRAME_SKIP)
+        t0 = time.time()
+        _ = game.make_action(action_vector, FRAME_SKIP)  # ignore engine reward; we compute our own
         timings['env_step'].append(time.time() - t0)
+
+        # Compute custom extrinsic reward based on prev and current states
+        curr_state = game.get_state()  # might be None if episode ended immediately after action
+        rwd_e = rewarder.compute(prev_state_for_reward, curr_state, game, done_flag=game.is_episode_finished())
+        prev_state_for_reward = curr_state if curr_state is not None else None
 
         t0 = time.time()
         obss.append(obs_stacked_np.astype(np.uint8))
@@ -341,8 +594,8 @@ if __name__ == '__main__':
                         Image.fromarray(rgb_curr, mode='RGB').save(f'{save_frame_dir}/frame_{i:04d}_current.png')
                         action_name = action_names[act_idx] if act_idx < len(action_names) else f'ACT_{act_idx}'
                         with open(f'{save_frame_dir}/frame_{i:04d}_{action_name}.txt', 'w') as f:
-                            f.write(f'Action: {action_name}\\n')
-                            f.write(f'Intrinsic Reward: {r_i:.6f}\\n')
+                            f.write(f'Action: {action_name}\n')
+                            f.write(f'Intrinsic Reward: {r_i:.6f}\n')
                             f.write(f'Extrinsic Reward: {r_e:.3f}\n')
 
                     debug_episode_saved = True
