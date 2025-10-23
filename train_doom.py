@@ -13,6 +13,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from peft import LoraConfig, get_peft_model, TaskType
 import wandb
+from tqdm import tqdm
 
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -63,68 +64,168 @@ def buttons_to_action_one_hot(buttons: list[str]) -> torch.Tensor:
             one_hot[VALID_ACTIONS.index(button)] = 1.0
     return one_hot
 
+def _load_single_episode(ep_path: str, width: int, height: int):
+    """Load a single episode from disk."""
+    try:
+        frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
+        json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
+        
+        frames, actions = [], []
+        for frame_file, json_file in zip(frame_files, json_files):
+            # Load and resize image
+            img = Image.open(os.path.join(ep_path, frame_file)).convert("RGB")
+            img = img.resize((width, height), Image.BILINEAR)
+            frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
+            
+            # Load action
+            with open(os.path.join(ep_path, json_file), "r") as f:
+                buttons = json.load(f)["action"]["buttons"]
+                actions.append(buttons_to_action_one_hot(buttons))
+        
+        return (torch.stack(frames), torch.stack(actions))
+    except Exception as e:
+        print(f"Error loading {ep_path}: {e}")
+        return None
+
 class DoomDataset(Dataset):
-    def __init__(self, data_dir: str, n_hist: int, height: int = 240, width: int = 320):
+    def __init__(self, data_dir: str, n_hist: int, height: int = 240, width: int = 320, preload_to_ram: bool = True):
+        """
+        Efficient dataset that preloads all data into RAM for fast access.
+        
+        Args:
+            data_dir: Directory containing episode subdirectories
+            n_hist: Number of history frames to load
+            height: Target image height
+            width: Target image width
+            preload_to_ram: If True, preload all images and actions into RAM (default: True)
+        """
         self.data_dir = data_dir
         self.n_hist = n_hist
         self.height = height
         self.width = width
+        
+        # Find all episodes
         self.episode_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
                              if os.path.isdir(os.path.join(data_dir, f))]
         self.episode_paths.sort()
-        self.episode_lengths = [len([f for f in os.listdir(ep) if f.endswith(".png")]) 
-                               for ep in self.episode_paths]
+        
+        print(f"Loading {len(self.episode_paths)} episodes from {data_dir}...")
+        
+        # Preload all data into RAM for maximum efficiency
+        self.episodes_data = []  # List of (frames_tensor, actions_tensor) tuples
+        
+        if preload_to_ram:
+            # Sequential loading on single CPU
+            print(f"Preloading all data into RAM using single CPU...")
+            
+            # Load episodes sequentially with progress bar
+            for ep_path in tqdm(self.episode_paths, desc="Loading episodes", unit="ep"):
+                result = _load_single_episode(ep_path, self.width, self.height)
+                if result is not None:
+                    self.episodes_data.append(result)
+            
+            if len(self.episodes_data) < len(self.episode_paths):
+                print(f"⚠ Warning: {len(self.episode_paths) - len(self.episodes_data)} episodes failed to load")
+            
+            print(f"✓ Preloading complete! {len(self.episodes_data)} episodes are in RAM.")
+        else:
+            # Just store paths and compute lengths
+            self.episode_lengths = [len([f for f in os.listdir(ep) if f.endswith(".png")]) 
+                                   for ep in self.episode_paths]
     
     def __len__(self):
-        return len(self.episode_paths)
+        return len(self.episodes_data) if self.episodes_data else len(self.episode_paths)
     
     def load_episode_frames(self, idx: int, n_frames: int, start_idx: int = 0):
-        ep_path = self.episode_paths[idx]
-        actual_n_frames = min(n_frames, self.episode_lengths[idx] - start_idx)
-        
-        frames, actions = [], []
-        frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
-        json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
-        
-        for i in range(start_idx, start_idx + actual_n_frames):
-            img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
-            img = img.resize((self.width, self.height), Image.BILINEAR)
-            frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
+        """Load specific frames from an episode (used for test/validation)."""
+        if self.episodes_data:
+            # Use preloaded data
+            frames_all, actions_all = self.episodes_data[idx]
+            ep_len = len(frames_all)
+            actual_n_frames = min(n_frames, ep_len - start_idx)
             
-            with open(os.path.join(ep_path, json_files[i]), "r") as f:
-                buttons = json.load(f)["action"]["buttons"]
-                actions.append(buttons_to_action_one_hot(buttons))
-        
-        while len(frames) < n_frames:
-            frames.append(torch.zeros(3, self.height, self.width))
-            actions.append(torch.zeros(len(VALID_ACTIONS)))
-        
-        return torch.stack(frames), torch.stack(actions)
+            frames = frames_all[start_idx:start_idx + actual_n_frames]
+            actions = actions_all[start_idx:start_idx + actual_n_frames]
+            
+            # Pad if needed
+            if len(frames) < n_frames:
+                pad_frames = torch.zeros(n_frames - len(frames), 3, self.height, self.width)
+                pad_actions = torch.zeros(n_frames - len(frames), len(VALID_ACTIONS))
+                frames = torch.cat([frames, pad_frames], dim=0)
+                actions = torch.cat([actions, pad_actions], dim=0)
+            
+            return frames, actions
+        else:
+            # Fallback to disk loading
+            ep_path = self.episode_paths[idx]
+            actual_n_frames = min(n_frames, self.episode_lengths[idx] - start_idx)
+            
+            frames, actions = [], []
+            frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
+            json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
+            
+            for i in range(start_idx, start_idx + actual_n_frames):
+                img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
+                img = img.resize((self.width, self.height), Image.BILINEAR)
+                frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
+                
+                with open(os.path.join(ep_path, json_files[i]), "r") as f:
+                    buttons = json.load(f)["action"]["buttons"]
+                    actions.append(buttons_to_action_one_hot(buttons))
+            
+            while len(frames) < n_frames:
+                frames.append(torch.zeros(3, self.height, self.width))
+                actions.append(torch.zeros(len(VALID_ACTIONS)))
+            
+            return torch.stack(frames), torch.stack(actions)
     
     def __getitem__(self, idx):
-        ep_path = self.episode_paths[idx]
-        ep_len = self.episode_lengths[idx]
-        start_idx = 0 if ep_len <= self.n_hist else random.randint(0, ep_len - self.n_hist)
-        actual_n_hist = min(ep_len, self.n_hist)
-        
-        frames, actions = [], []
-        frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
-        json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
-        
-        for i in range(start_idx, start_idx + actual_n_hist):
-            img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
-            img = img.resize((self.width, self.height), Image.BILINEAR)
-            frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
+        """Fast random access from preloaded RAM data."""
+        if self.episodes_data:
+            # Use preloaded data (fast path)
+            frames_all, actions_all = self.episodes_data[idx]
+            ep_len = len(frames_all)
             
-            with open(os.path.join(ep_path, json_files[i]), "r") as f:
-                buttons = json.load(f)["action"]["buttons"]
-                actions.append(buttons_to_action_one_hot(buttons))
-        
-        while len(frames) < self.n_hist:
-            frames.append(torch.zeros(3, self.height, self.width))
-            actions.append(torch.zeros(len(VALID_ACTIONS)))
-        
-        return torch.stack(frames), torch.stack(actions)
+            # Random starting point
+            start_idx = 0 if ep_len <= self.n_hist else random.randint(0, ep_len - self.n_hist)
+            actual_n_hist = min(ep_len, self.n_hist)
+            
+            frames = frames_all[start_idx:start_idx + actual_n_hist]
+            actions = actions_all[start_idx:start_idx + actual_n_hist]
+            
+            # Pad if needed
+            if len(frames) < self.n_hist:
+                pad_frames = torch.zeros(self.n_hist - len(frames), 3, self.height, self.width)
+                pad_actions = torch.zeros(self.n_hist - len(frames), len(VALID_ACTIONS))
+                frames = torch.cat([frames, pad_frames], dim=0)
+                actions = torch.cat([actions, pad_actions], dim=0)
+            
+            return frames, actions
+        else:
+            # Fallback to disk loading (slow path)
+            ep_path = self.episode_paths[idx]
+            ep_len = self.episode_lengths[idx]
+            start_idx = 0 if ep_len <= self.n_hist else random.randint(0, ep_len - self.n_hist)
+            actual_n_hist = min(ep_len, self.n_hist)
+            
+            frames, actions = [], []
+            frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
+            json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
+            
+            for i in range(start_idx, start_idx + actual_n_hist):
+                img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
+                img = img.resize((self.width, self.height), Image.BILINEAR)
+                frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
+                
+                with open(os.path.join(ep_path, json_files[i]), "r") as f:
+                    buttons = json.load(f)["action"]["buttons"]
+                    actions.append(buttons_to_action_one_hot(buttons))
+            
+            while len(frames) < self.n_hist:
+                frames.append(torch.zeros(3, self.height, self.width))
+                actions.append(torch.zeros(len(VALID_ACTIONS)))
+            
+            return torch.stack(frames), torch.stack(actions)
     
 
 class Conditioner(nn.Module):
@@ -454,8 +555,18 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
     )
     
     vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder = build_models(cfg, device)
-    train_dataset = DoomDataset(data_dir=data_dir, n_hist=cfg.n_hist, height=cfg.height, width=cfg.width)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    train_dataset = DoomDataset(data_dir=data_dir, n_hist=cfg.n_hist, height=cfg.height, width=cfg.width, preload_to_ram=True)
+    
+    # DataLoader with single CPU (num_workers=0)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=0,  # Single CPU for data loading
+        pin_memory=True,  # Faster CPU-to-GPU transfers
+    )
+    print(f"DataLoader configured with single CPU (num_workers=0)")
+    
     model_dtype = next(unet.parameters()).dtype
     
     print(f"Dataset: {len(train_dataset)} episodes")
@@ -555,17 +666,28 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
             create_rollout_comparison_grid(epoch_dir, cfg.n_hist, rollout_steps)
             print(f"Rollout saved to: {epoch_dir}")
         
+        # Save checkpoint every 100 epochs
+        if (epoch + 1) % 100 == 0:
+            if cfg.use_lora:
+                ckpt_dir = f"checkpoints/doom_lora/{timestamp}/epoch_{epoch+1:04d}"
+                os.makedirs(ckpt_dir, exist_ok=True)
+                unet.save_pretrained(f"{ckpt_dir}/unet")
+                conditioner.save_pretrained(f"{ckpt_dir}/conditioner")
+                noise_bucketer.save_pretrained(f"{ckpt_dir}/noise_bucketer")
+                print(f"✓ Checkpoint saved at epoch {epoch+1}: {ckpt_dir}/")
+        
         unet.train()
         conditioner.train()
         noise_bucketer.train()
     
+    # Save final checkpoint
     if cfg.use_lora:
-        save_dir = f"checkpoints/doom_lora/{timestamp}"
+        save_dir = f"checkpoints/doom_lora/{timestamp}/final"
         os.makedirs(save_dir, exist_ok=True)
         unet.save_pretrained(f"{save_dir}/unet")
         conditioner.save_pretrained(f"{save_dir}/conditioner")
         noise_bucketer.save_pretrained(f"{save_dir}/noise_bucketer")
-        print(f"LoRA adapters saved to {save_dir}/")
+        print(f"✓ Final checkpoint saved to {save_dir}/")
     
     wandb.finish()
 
