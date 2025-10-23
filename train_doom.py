@@ -3,7 +3,6 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from datetime import datetime
-from multiprocessing import Pool, cpu_count
 
 import torch
 import torch.nn as nn
@@ -570,7 +569,7 @@ def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer,
         # Epsilon-prediction objective: model predicts noise
         return F.mse_loss(model_output, noise)
 
-def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10, lr: float = 1e-4, use_xpred: bool = True):
+def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10, lr: float = 1e-4, use_xpred: bool = True, preload_to_ram: bool = False, rollout_interval: int = 1):
     cfg = DoomSimCfg()
     cfg.use_xpred = use_xpred
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
@@ -601,7 +600,8 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
     )
     
     vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder = build_models(cfg, device)
-    train_dataset = DoomDataset(data_dir=data_dir, n_hist=cfg.n_hist, height=cfg.height, width=cfg.width, preload_to_ram=True)
+    train_dataset = DoomDataset(data_dir=data_dir, n_hist=cfg.n_hist, height=cfg.height, width=cfg.width, preload_to_ram=preload_to_ram)
+    print(f"Dataset mode: {'Preloaded to RAM' if preload_to_ram else 'Load on-demand from disk'}")
     
     # DataLoader with single CPU (num_workers=0)
     train_loader = DataLoader(
@@ -634,6 +634,7 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
     rollout_dir = f"debug/rollouts/{timestamp}"
     os.makedirs(rollout_dir, exist_ok=True)
     print(f"Rollouts will be saved to: {rollout_dir}")
+    print(f"Rollout interval: every {rollout_interval} epoch(s)")
     
     for epoch in range(num_epochs):
         total_loss = 0.0
@@ -664,58 +665,60 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
         print(f"[{epoch+1}/{num_epochs}] Average Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
         wandb.log({"epoch_loss": avg_loss, "learning_rate": current_lr, "epoch": epoch + 1})
         
-        print(f"\nRunning rollout for epoch {epoch+1}...")
-        unet.eval()
-        conditioner.eval()
-        noise_bucketer.eval()
-        
-        with torch.no_grad():
-            predicted_frames = []
-            current_context = test_context.clone()
+        # Run rollout at specified intervals
+        if (epoch + 1) % rollout_interval == 0:
+            print(f"\nRunning rollout for epoch {epoch+1}...")
+            unet.eval()
+            conditioner.eval()
+            noise_bucketer.eval()
             
-            for step in range(rollout_steps):
-                action_expanded = test_action_seq[:, step:step+1].expand(-1, cfg.n_hist - 1, -1)
-                context_frames = current_context[:, -(cfg.n_hist-1):]
+            with torch.no_grad():
+                predicted_frames = []
+                current_context = test_context.clone()
                 
-                ctx = encode_images_to_latents(
-                    vae, context_frames.flatten(0, 1), cfg.vae_scaling_factor
-                ).reshape(1, cfg.n_hist - 1, cfg.latent_channels, cfg.height//8, cfg.width//8)
+                for step in range(rollout_steps):
+                    action_expanded = test_action_seq[:, step:step+1].expand(-1, cfg.n_hist - 1, -1)
+                    context_frames = current_context[:, -(cfg.n_hist-1):]
+                    
+                    ctx = encode_images_to_latents(
+                        vae, context_frames.flatten(0, 1), cfg.vae_scaling_factor
+                    ).reshape(1, cfg.n_hist - 1, cfg.latent_channels, cfg.height//8, cfg.width//8)
+                    
+                    action_text_embeds, obs_mask = conditioner(action_expanded, None)
+                    timestep_cond = noise_bucketer(torch.zeros(1, dtype=torch.long, device=device))
+                    
+                    lat = torch.randn(1, cfg.latent_channels, cfg.height // 8, cfg.width // 8, 
+                                     device=device, dtype=model_dtype)
+                    scheduler.set_timesteps(cfg.num_inference_steps, device=device)
+                    
+                    for t in scheduler.timesteps:
+                        x_in = torch.cat([lat, ctx.flatten(1, 2)], dim=1)
+                        x0_pred = cfg_only_on_observation(
+                            unet, x_in, t.expand(1), action_text_embeds, obs_mask, timestep_cond, cfg.cfg_weight
+                        )
+                        lat = scheduler.step(x0_pred, t, lat).prev_sample
+                    
+                    next_frame = vae.decode(lat / cfg.vae_scaling_factor).sample
+                    predicted_frames.append(next_frame)
+                    current_context = torch.cat([current_context[:, 1:], next_frame.unsqueeze(1)], dim=1)
                 
-                action_text_embeds, obs_mask = conditioner(action_expanded, None)
-                timestep_cond = noise_bucketer(torch.zeros(1, dtype=torch.long, device=device))
+                epoch_dir = os.path.join(rollout_dir, f"epoch_{epoch+1:03d}")
+                os.makedirs(epoch_dir, exist_ok=True)
                 
-                lat = torch.randn(1, cfg.latent_channels, cfg.height // 8, cfg.width // 8, 
-                                 device=device, dtype=model_dtype)
-                scheduler.set_timesteps(cfg.num_inference_steps, device=device)
+                for i in range(cfg.n_hist):
+                    frame = (test_context[0, i].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+                    Image.fromarray(frame).save(os.path.join(epoch_dir, f"context_{i:02d}.png"))
                 
-                for t in scheduler.timesteps:
-                    x_in = torch.cat([lat, ctx.flatten(1, 2)], dim=1)
-                    x0_pred = cfg_only_on_observation(
-                        unet, x_in, t.expand(1), action_text_embeds, obs_mask, timestep_cond, cfg.cfg_weight
-                    )
-                    lat = scheduler.step(x0_pred, t, lat).prev_sample
+                for i, frame in enumerate(predicted_frames):
+                    frame_np = (frame[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+                    Image.fromarray(frame_np).save(os.path.join(epoch_dir, f"pred_{i:02d}.png"))
                 
-                next_frame = vae.decode(lat / cfg.vae_scaling_factor).sample
-                predicted_frames.append(next_frame)
-                current_context = torch.cat([current_context[:, 1:], next_frame.unsqueeze(1)], dim=1)
-            
-            epoch_dir = os.path.join(rollout_dir, f"epoch_{epoch+1:03d}")
-            os.makedirs(epoch_dir, exist_ok=True)
-            
-            for i in range(cfg.n_hist):
-                frame = (test_context[0, i].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-                Image.fromarray(frame).save(os.path.join(epoch_dir, f"context_{i:02d}.png"))
-            
-            for i, frame in enumerate(predicted_frames):
-                frame_np = (frame[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-                Image.fromarray(frame_np).save(os.path.join(epoch_dir, f"pred_{i:02d}.png"))
-            
-            for i in range(rollout_steps):
-                frame = (test_gt_frames[0, i].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-                Image.fromarray(frame).save(os.path.join(epoch_dir, f"gt_{i:02d}.png"))
-            
-            create_rollout_comparison_grid(epoch_dir, cfg.n_hist, rollout_steps)
-            print(f"Rollout saved to: {epoch_dir}")
+                for i in range(rollout_steps):
+                    frame = (test_gt_frames[0, i].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+                    Image.fromarray(frame).save(os.path.join(epoch_dir, f"gt_{i:02d}.png"))
+                
+                create_rollout_comparison_grid(epoch_dir, cfg.n_hist, rollout_steps)
+                print(f"Rollout saved to: {epoch_dir}")
         
         # Save checkpoint every 100 epochs
         if (epoch + 1) % 100 == 0:
@@ -730,6 +733,9 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
         unet.train()
         conditioner.train()
         noise_bucketer.train()
+        
+        # Step the learning rate scheduler
+        scheduler_lr.step()
     
     # Save final checkpoint
     if cfg.use_lora:
@@ -814,7 +820,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--xpred", type=lambda x: x.lower() == 'true', default=True, help="Use X-prediction (sample) if True, else epsilon (noise) prediction (default: True)")
+    parser.add_argument("--preload", action="store_true", help="Preload all data to RAM (default: False, load on-demand from disk)")
+    parser.add_argument("--rollout_interval", type=int, default=1, help="Run rollout every N epochs (default: 1, every epoch)")
     args = parser.parse_args()
     
-    train(data_dir=args.data_dir, batch_size=args.batch_size, num_epochs=args.epochs, lr=args.lr, use_xpred=args.xpred)
+    train(data_dir=args.data_dir, batch_size=args.batch_size, num_epochs=args.epochs, lr=args.lr, use_xpred=args.xpred, preload_to_ram=args.preload, rollout_interval=args.rollout_interval)
 
