@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from datetime import datetime
+from multiprocessing import Pool, cpu_count
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from peft import LoraConfig, get_peft_model, TaskType
 import wandb
+from tqdm import tqdm
 from tqdm import tqdm
 
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
@@ -105,6 +107,8 @@ class DoomDataset(Dataset):
         self.width = width
         
         # Find all episodes
+        
+        # Find all episodes
         self.episode_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
                              if os.path.isdir(os.path.join(data_dir, f))]
         self.episode_paths.sort()
@@ -135,8 +139,50 @@ class DoomDataset(Dataset):
     
     def __len__(self):
         return len(self.episodes_data) if self.episodes_data else len(self.episode_paths)
+        return len(self.episodes_data) if self.episodes_data else len(self.episode_paths)
     
     def load_episode_frames(self, idx: int, n_frames: int, start_idx: int = 0):
+        """Load specific frames from an episode (used for test/validation)."""
+        if self.episodes_data:
+            # Use preloaded data
+            frames_all, actions_all = self.episodes_data[idx]
+            ep_len = len(frames_all)
+            actual_n_frames = min(n_frames, ep_len - start_idx)
+            
+            frames = frames_all[start_idx:start_idx + actual_n_frames]
+            actions = actions_all[start_idx:start_idx + actual_n_frames]
+            
+            # Pad if needed
+            if len(frames) < n_frames:
+                pad_frames = torch.zeros(n_frames - len(frames), 3, self.height, self.width)
+                pad_actions = torch.zeros(n_frames - len(frames), len(VALID_ACTIONS))
+                frames = torch.cat([frames, pad_frames], dim=0)
+                actions = torch.cat([actions, pad_actions], dim=0)
+            
+            return frames, actions
+        else:
+            # Fallback to disk loading
+            ep_path = self.episode_paths[idx]
+            actual_n_frames = min(n_frames, self.episode_lengths[idx] - start_idx)
+            
+            frames, actions = [], []
+            frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
+            json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
+            
+            for i in range(start_idx, start_idx + actual_n_frames):
+                img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
+                img = img.resize((self.width, self.height), Image.BILINEAR)
+                frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
+                
+                with open(os.path.join(ep_path, json_files[i]), "r") as f:
+                    buttons = json.load(f)["action"]["buttons"]
+                    actions.append(buttons_to_action_one_hot(buttons))
+            
+            while len(frames) < n_frames:
+                frames.append(torch.zeros(3, self.height, self.width))
+                actions.append(torch.zeros(len(VALID_ACTIONS)))
+            
+            return torch.stack(frames), torch.stack(actions)
         """Load specific frames from an episode (used for test/validation)."""
         if self.episodes_data:
             # Use preloaded data
@@ -575,6 +621,10 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
         list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()), lr=lr
     )
     
+    # Cosine annealing LR scheduler
+    scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=lr * 0.01)
+    print(f"Using CosineAnnealingLR: initial_lr={lr}, eta_min={lr * 0.01}, T_max={num_epochs}")
+    
     rollout_steps = 8
     test_frames, test_actions = train_dataset.load_episode_frames(idx=0, n_frames=cfg.n_hist + rollout_steps, start_idx=0)
     test_context = test_frames[:cfg.n_hist].unsqueeze(0).to(device=device, dtype=model_dtype)
@@ -610,8 +660,9 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
                 wandb.log({"batch_loss": loss.item(), "epoch": epoch + 1, "batch": batch_idx})
         
         avg_loss = total_loss / len(train_loader)
-        print(f"[{epoch+1}/{num_epochs}] Average Loss: {avg_loss:.4f}")
-        wandb.log({"epoch_loss": avg_loss, "epoch": epoch + 1})
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"[{epoch+1}/{num_epochs}] Average Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
+        wandb.log({"epoch_loss": avg_loss, "learning_rate": current_lr, "epoch": epoch + 1})
         
         print(f"\nRunning rollout for epoch {epoch+1}...")
         unet.eval()
