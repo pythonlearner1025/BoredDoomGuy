@@ -370,8 +370,8 @@ def run_episode(thread_id, agent, fwd_model, phi_enc, buffer, stats, frame_count
         save_rgb_debug: If True, save RGB frames for debug visualization
     """
     game = vzd.DoomGame()
-    # Get WAD path relative to this script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Look in project root (parent of agents/)
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     wad_path = os.path.join(script_dir, "Doom1.WAD")
     if not os.path.exists(wad_path):
         raise FileNotFoundError(f"Doom1.WAD not found at {wad_path}. Please place it in the repo root.")
@@ -711,7 +711,9 @@ if __name__ == '__main__':
 
                 # Save debug frames from the selected thread (only once)
                 if thread_id == debug_thread_id and not debug_episode_saved and obss_rgb is not None:
-                    debug_dir = f'debug/iter_{iter_idx+1:04d}'
+                    # Create debug dir in project root
+                    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    debug_dir = os.path.join(project_root, f'debug/iter_{iter_idx+1:04d}')
                     os.makedirs(debug_dir, exist_ok=True)
                     action_names = ['NOOP', 'FWD', 'BACK', 'TURN_L', 'TURN_R', 'FWD_L', 'FWD_R',
                                    'ATTACK', 'USE', 'FWD_ATK', 'STRAFE_L', 'STRAFE_R']

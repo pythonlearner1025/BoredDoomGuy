@@ -98,7 +98,8 @@ def warmup_observation_stats(ob_rms):
 
 def setup_game():
     game = vzd.DoomGame()
-    wad_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Doom1.WAD")
+    # Look in project root (parent of agents/)
+    wad_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Doom1.WAD")
     game.set_doom_game_path(wad_path)
     game.set_doom_map("E1M1")
     game.set_render_hud(False)
@@ -289,7 +290,8 @@ def setup_game_gdm_style():
     Returns (game, reward_shaper).
     """
     game = vzd.DoomGame()
-    wad_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Doom1.WAD")
+    # Look in project root (parent of agents/)
+    wad_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Doom1.WAD")
     game.set_doom_game_path(wad_path)
     game.set_doom_map("E1M1")
 
@@ -528,7 +530,9 @@ if __name__ == '__main__':
     print(f"Device: {device_name} | Workers: {n_threads}")
     
     torch.autograd.set_detect_anomaly(True)
-    debug_dir = f'debug/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    # Create debug dir in project root
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    debug_dir = os.path.join(project_root, f'debug/{datetime.now().strftime("%Y%m%d_%H%M%S")}')
     os.makedirs(debug_dir, exist_ok=True)
 
     init_wandb(wandb_config)

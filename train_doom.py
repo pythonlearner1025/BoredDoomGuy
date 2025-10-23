@@ -1,8 +1,8 @@
 import json
 import os
-import sys
 from dataclasses import dataclass
 from typing import Optional, Tuple
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ import random
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from peft import LoraConfig, get_peft_model, TaskType
+import wandb
 
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -20,37 +21,31 @@ from transformers import CLIPTokenizer, CLIPTextModel
 
 @dataclass
 class DoomSimCfg:
-    # Context window and noise augmentation
-    n_hist: int = 2  # reduced from 64 for memory efficiency
-    alpha_max: float = 0.25  # tune for AR stability
+    n_hist: int = 64
+    alpha_max: float = 0.25
     k_buckets: int = 8
-    # Guidance and sampling
-    cfg_weight: float = 1.5  # apply only on observation tokens
-    num_inference_steps: int = 4  # DDIM steps
-    # Embedding sizes
-    text_hidden_size: int = 768  # SD1.5 cross-attn dim
-    noise_embed_dim: int = 256  # fed through UNet `time_cond_proj_dim`
-    action_vocab_size: int = 6  # number of valid actions
+    cfg_weight: float = 1.5
+    num_inference_steps: int = 4
+    text_hidden_size: int = 768
+    noise_embed_dim: int = 256
+    action_vocab_size: int = 6
     action_embed_dim: int = 12
-    caption_vocab_size: int = 0  # 0 to disable caption path
+    caption_vocab_size: int = 0
     caption_embed_dim: int = 256
-    # CLIP 
-    use_clip_captions: bool = False  # disabled to save memory on MPS
-    clip_model_name_or_path: str = "openai/clip-vit-large-patch14"  # SD 1.x text encoder
+    use_clip_captions: bool = False
+    clip_model_name_or_path: str = "openai/clip-vit-large-patch14"
     caption_max_length: int = 77
-    # Optimization
     grad_clip: float = 1.0
     mixed_precision: bool = False
-    # LoRA configuration
     use_lora: bool = True
-    lora_r: int = 1
+    lora_r: int = 128 
     lora_alpha: int = 16
     lora_dropout: float = 0.05
-    # Model defaults (keep SD1.5-like)
     latent_channels: int = 4
     vae_scaling_factor: float = 0.18215
-    height: int = 240  # input image H
-    width: int = 320   # input image W
+    height: int = 120
+    width: int = 160
+    use_xpred: bool = True  # X-prediction (sample) vs epsilon (noise) prediction
 
 VALID_ACTIONS = [
     "MOVE_FORWARD",
@@ -62,12 +57,10 @@ VALID_ACTIONS = [
 ]
 
 def buttons_to_action_one_hot(buttons: list[str]) -> torch.Tensor:
-    """Convert button list to one-hot encoded action vector."""
     one_hot = torch.zeros(len(VALID_ACTIONS), dtype=torch.float32)
     for button in buttons:
         if button in VALID_ACTIONS:
-            idx = VALID_ACTIONS.index(button)
-            one_hot[idx] = 1.0
+            one_hot[VALID_ACTIONS.index(button)] = 1.0
     return one_hot
 
 class DoomDataset(Dataset):
@@ -76,69 +69,62 @@ class DoomDataset(Dataset):
         self.n_hist = n_hist
         self.height = height
         self.width = width
-        self.episode_paths = []
-        
-        # Collect all episode directories
-        for file in os.listdir(data_dir):
-            ep_path = os.path.join(data_dir, file)
-            if os.path.isdir(ep_path):
-                self.episode_paths.append(ep_path)
+        self.episode_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
+                             if os.path.isdir(os.path.join(data_dir, f))]
         self.episode_paths.sort()
-        
-        # Cache episode lengths for efficient sampling
-        self.episode_lengths = []
-        for ep_path in self.episode_paths:
-            n_frames = len([f for f in os.listdir(ep_path) if f.endswith(".png")])
-            self.episode_lengths.append(n_frames)
+        self.episode_lengths = [len([f for f in os.listdir(ep) if f.endswith(".png")]) 
+                               for ep in self.episode_paths]
     
     def __len__(self):
         return len(self.episode_paths)
     
+    def load_episode_frames(self, idx: int, n_frames: int, start_idx: int = 0):
+        ep_path = self.episode_paths[idx]
+        actual_n_frames = min(n_frames, self.episode_lengths[idx] - start_idx)
+        
+        frames, actions = [], []
+        frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
+        json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
+        
+        for i in range(start_idx, start_idx + actual_n_frames):
+            img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
+            img = img.resize((self.width, self.height), Image.BILINEAR)
+            frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
+            
+            with open(os.path.join(ep_path, json_files[i]), "r") as f:
+                buttons = json.load(f)["action"]["buttons"]
+                actions.append(buttons_to_action_one_hot(buttons))
+        
+        while len(frames) < n_frames:
+            frames.append(torch.zeros(3, self.height, self.width))
+            actions.append(torch.zeros(len(VALID_ACTIONS)))
+        
+        return torch.stack(frames), torch.stack(actions)
+    
     def __getitem__(self, idx):
-        """Sample n_hist sequential frames and actions from episode idx."""
         ep_path = self.episode_paths[idx]
         ep_len = self.episode_lengths[idx]
+        start_idx = 0 if ep_len <= self.n_hist else random.randint(0, ep_len - self.n_hist)
+        actual_n_hist = min(ep_len, self.n_hist)
         
-        # Sample random start index ensuring we have n_hist frames
-        if ep_len <= self.n_hist:
-            start_idx = 0
-            actual_n_hist = ep_len
-        else:
-            start_idx = random.randint(0, ep_len - self.n_hist)
-            actual_n_hist = self.n_hist
-        
-        # Load frames and actions
-        frames = []
-        actions = []
-        
+        frames, actions = [], []
         frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
         json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
         
         for i in range(start_idx, start_idx + actual_n_hist):
-            # Load image
-            img_path = os.path.join(ep_path, frame_files[i])
-            img = Image.open(img_path).convert("RGB")
+            img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
             img = img.resize((self.width, self.height), Image.BILINEAR)
-            img_array = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
-            frames.append(img_array)
+            frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
             
-            # Load action
-            json_path = os.path.join(ep_path, json_files[i])
-            with open(json_path, "r") as f:
-                json_data = json.load(f)
-                buttons = json_data["action"]["buttons"]
-                action_one_hot = buttons_to_action_one_hot(buttons)
-                actions.append(action_one_hot)
+            with open(os.path.join(ep_path, json_files[i]), "r") as f:
+                buttons = json.load(f)["action"]["buttons"]
+                actions.append(buttons_to_action_one_hot(buttons))
         
-        # Pad if needed
         while len(frames) < self.n_hist:
             frames.append(torch.zeros(3, self.height, self.width))
             actions.append(torch.zeros(len(VALID_ACTIONS)))
         
-        frames = torch.stack(frames)  # [n_hist, 3, H, W]
-        actions = torch.stack(actions)  # [n_hist, act_dim]
-        
-        return frames, actions
+        return torch.stack(frames), torch.stack(actions)
     
 
 class Conditioner(nn.Module):
@@ -232,45 +218,36 @@ def inflate_conv_in_for_history(unet: UNet2DConditionModel, old_in: int, new_in:
         unet.conv_in = new_conv
 
 def build_models(cfg: DoomSimCfg, device: torch.device):
-    # Determine optimal dtype
     if device.type == "cuda":
-        if torch.cuda.is_bf16_supported():
-            dtype = torch.bfloat16
-            print("Using dtype: bfloat16")
-        else:
-            dtype = torch.float16
-            print("Using dtype: float16")
-    elif device.type == "mps":
-        # MPS has mixed precision bugs with float16 - use float32 for stability
-        dtype = torch.float32
-        print("Using dtype: float32 (MPS - float16 causes dtype mismatch errors)")
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     else:
         dtype = torch.float32
-        print("Using dtype: float32 (CPU)")
+    print(f"Using dtype: {dtype}")
     
-    vae = AutoencoderKL(
-        sample_size=cfg.height // 8,
-        latent_channels=cfg.latent_channels,
-        scaling_factor=cfg.vae_scaling_factor,
-    ).to(device, dtype=dtype)
+    print("Loading pretrained SD 1.5 components...")
+    vae = AutoencoderKL.from_pretrained(
+        "runwayml/stable-diffusion-v1-5", subfolder="vae", torch_dtype=dtype
+    ).to(device)
     for p in vae.encoder.parameters():
         p.requires_grad = False
 
-    in_channels = cfg.latent_channels * cfg.n_hist  # current + (n_hist-1) context
-    unet = UNet2DConditionModel(
-        in_channels=in_channels,
-        out_channels=cfg.latent_channels,
-        cross_attention_dim=cfg.text_hidden_size,
-        time_cond_proj_dim=cfg.noise_embed_dim,
-        # SD1.5-like defaults
-        block_out_channels=(320, 640, 1280, 1280),
-        down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
-        up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
-        layers_per_block=2,
-        attention_head_dim=8,
-    ).to(device, dtype=dtype)
+    unet = UNet2DConditionModel.from_pretrained(
+        "runwayml/stable-diffusion-v1-5", subfolder="unet", torch_dtype=dtype
+    ).to(device)
     
-    scheduler = DDIMScheduler()
+    in_channels = cfg.latent_channels * (cfg.n_hist - 1)
+    total_in_channels = cfg.latent_channels + in_channels
+    inflate_conv_in_for_history(unet, old_in=4, new_in=total_in_channels)
+    
+    if unet.time_embedding.cond_proj is None:
+        time_embed_input_dim = unet.time_embedding.linear_1.in_features
+        unet.time_embedding.cond_proj = nn.Linear(cfg.noise_embed_dim, time_embed_input_dim).to(device, dtype=dtype)
+    
+    prediction_type = "sample" if cfg.use_xpred else "epsilon"
+    scheduler = DDIMScheduler.from_pretrained(
+        "runwayml/stable-diffusion-v1-5", subfolder="scheduler", prediction_type=prediction_type
+    )
+    print(f"Using prediction type: {prediction_type}")
     
     conditioner = Conditioner(
         action_vocab_size=cfg.action_vocab_size,
@@ -287,168 +264,221 @@ def build_models(cfg: DoomSimCfg, device: torch.device):
                 cfg.clip_model_name_or_path, max_length=cfg.caption_max_length, device=device, dtype=dtype
             )
         except Exception as e:
-            print(f"[warn] CLIP caption encoder not available: {e}. Falling back to learned caption embeddings if any.")
+            print(f"CLIP encoder unavailable: {e}")
 
-    # Apply LoRA to trainable modules
     if cfg.use_lora:
-        print(f"\nApplying LoRA (r={cfg.lora_r}, alpha={cfg.lora_alpha})...")
+        print(f"Applying LoRA to all linear layers (r={cfg.lora_r}, alpha={cfg.lora_alpha})...")
         
-        # LoRA for UNet (target attention and conv layers)
+        # Apply LoRA to ALL linear layers in UNet
         unet_lora_config = LoraConfig(
-            r=cfg.lora_r,
-            lora_alpha=cfg.lora_alpha,
-            target_modules=["to_q", "to_k", "to_v", "to_out.0", "proj_in", "proj_out"],
+            r=cfg.lora_r, 
+            lora_alpha=cfg.lora_alpha, 
             lora_dropout=cfg.lora_dropout,
+            target_modules="all-linear",
+            modules_to_save=[]
         )
         unet = get_peft_model(unet, unet_lora_config)
+        print("UNet LoRA applied:")
         unet.print_trainable_parameters()
         
-        # LoRA for Conditioner
+        # Apply LoRA to ALL linear layers in Conditioner
         conditioner_lora_config = LoraConfig(
-            r=cfg.lora_r,  # smaller rank for smaller model
-            lora_alpha=cfg.lora_alpha,
-            target_modules=["action_proj", "action_out"],
+            r=cfg.lora_r, 
+            lora_alpha=cfg.lora_alpha, 
             lora_dropout=cfg.lora_dropout,
+            target_modules="all-linear"
         )
         conditioner = get_peft_model(conditioner, conditioner_lora_config)
         print("Conditioner LoRA applied")
         
-        # LoRA for NoiseBucketer
-        bucketer_lora_config = LoraConfig(
-            r=cfg.lora_r,  # even smaller rank
-            lora_alpha=cfg.lora_alpha,
-            target_modules=["embed"],
+        # NoiseBucketer uses Embedding, not Linear, so target it specifically
+        noise_bucketer_lora_config = LoraConfig(
+            r=cfg.lora_r, 
+            lora_alpha=cfg.lora_alpha, 
             lora_dropout=cfg.lora_dropout,
+            target_modules=["embed"]
         )
-        noise_bucketer = get_peft_model(noise_bucketer, bucketer_lora_config)
-        print("NoiseBucketer LoRA applied\n")
+        noise_bucketer = get_peft_model(noise_bucketer, noise_bucketer_lora_config)
+        print("NoiseBucketer LoRA applied")
 
     return vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder
 
 def encode_images_to_latents(vae: AutoencoderKL, images: torch.Tensor, scaling_factor: float) -> torch.Tensor:
-    # images: [B, 3, H, W] -> latents [B, C_vae, H/8, W/8]
-    # Ensure dtype matches VAE to avoid MPS dtype mismatches
     images = images.to(device=vae.device, dtype=next(vae.parameters()).dtype)
-    latents = vae.encode(images).latent_dist.sample()
-    return latents * scaling_factor
+    return vae.encode(images).latent_dist.sample() * scaling_factor
 
-def cfg_only_on_observation(
-    unet: UNet2DConditionModel,
-    x_in: torch.Tensor,
-    t: torch.IntTensor,
-    enc_states: torch.Tensor,  # [B, T, H]
-    obs_mask: torch.BoolTensor,  # [B, T]
-    timestep_cond: torch.Tensor,  # [B, D]
-    cfg_weight: float,
-):
+def cfg_only_on_observation(unet, x_in, t, enc_states, obs_mask, timestep_cond, cfg_weight):
+    model_dtype = next(unet.parameters()).dtype
+    x_in, enc_states, timestep_cond = x_in.to(dtype=model_dtype), enc_states.to(dtype=model_dtype), timestep_cond.to(dtype=model_dtype)
+    
     enc_uncond = enc_states.clone()
-    # mask text conditioning 
     enc_uncond[obs_mask] = 0.0
-    # input both masked, unmasked for text cfg
-    enc_cat = torch.cat([enc_uncond, enc_states], dim=0)  # [2B, T, H]
-    x_cat = torch.cat([x_in, x_in], dim=0)
-    t_cat = torch.cat([t, t], dim=0)
-    cond_cat = torch.cat([timestep_cond, timestep_cond], dim=0)
+    enc_cat = torch.cat([enc_uncond, enc_states], dim=0)
+    x_cat, t_cat, cond_cat = torch.cat([x_in, x_in], dim=0), torch.cat([t, t], dim=0), torch.cat([timestep_cond, timestep_cond], dim=0)
+    
     out = unet(sample=x_cat, timestep=t_cat, encoder_hidden_states=enc_cat, timestep_cond=cond_cat).sample
     eps_uncond, eps_cond = out.chunk(2, dim=0)
-    eps = eps_uncond + cfg_weight * (eps_cond - eps_uncond)
-    return eps
+    return eps_uncond + cfg_weight * (eps_cond - eps_uncond)
 
-def train_step_teacher_forced(
-    vae: AutoencoderKL,
-    unet: UNet2DConditionModel,
-    scheduler: DDIMScheduler,
-    conditioner: Conditioner,
-    noise_bucketer: NoiseBucketer,
-    caption_encoder: Optional[CaptionEncoderCLIP],
-    cfg: DoomSimCfg,
-    past_images: torch.Tensor,   # [B, N_hist, 3, H, W]
-    actions: torch.FloatTensor,  # [B, N_hist, action_vocab_size] (one-hot)
-    current_images: torch.Tensor,  # [B, 3, H, W]
-    captions: Optional[list] = None,  # current frame caps
-): 
-    device = current_images.device
-    B, N_hist = past_images.shape[:2]
-    
+def create_rollout_comparison_grid(epoch_dir: str, n_context: int, n_rollout: int):
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        
+        # Load context frames (show last 4)
+        n_show_context = min(4, n_context)
+        context_imgs = []
+        for i in range(n_context - n_show_context, n_context):
+            img_path = os.path.join(epoch_dir, f"context_{i:02d}.png")
+            if os.path.exists(img_path):
+                context_imgs.append(np.array(Image.open(img_path)))
+        
+        # Load predicted and ground truth frames
+        pred_imgs = []
+        gt_imgs = []
+        for i in range(n_rollout):
+            pred_path = os.path.join(epoch_dir, f"pred_{i:02d}.png")
+            gt_path = os.path.join(epoch_dir, f"gt_{i:02d}.png")
+            if os.path.exists(pred_path):
+                pred_imgs.append(np.array(Image.open(pred_path)))
+            if os.path.exists(gt_path):
+                gt_imgs.append(np.array(Image.open(gt_path)))
+        
+        if not pred_imgs and not gt_imgs:
+            return
+        
+        # Create grid: 3 rows (context, predicted, ground truth)
+        n_cols = max(len(context_imgs), len(pred_imgs), len(gt_imgs))
+        fig, axes = plt.subplots(3, n_cols, figsize=(2.5*n_cols, 7.5))
+        
+        if n_cols == 1:
+            axes = axes.reshape(-1, 1)
+        
+        # Row 0: Context frames
+        for col in range(n_cols):
+            if col < len(context_imgs):
+                axes[0, col].imshow(context_imgs[col])
+                axes[0, col].set_title(f"Context {n_context - n_show_context + col}", fontsize=8)
+            axes[0, col].axis('off')
+        
+        # Row 1: Predicted frames
+        for col in range(n_cols):
+            if col < len(pred_imgs):
+                axes[1, col].imshow(pred_imgs[col])
+                axes[1, col].set_title(f"Predicted {col}", fontsize=8, color='blue')
+            axes[1, col].axis('off')
+        
+        # Row 2: Ground truth frames
+        for col in range(n_cols):
+            if col < len(gt_imgs):
+                axes[2, col].imshow(gt_imgs[col])
+                axes[2, col].set_title(f"Ground Truth {col}", fontsize=8, color='green')
+            axes[2, col].axis('off')
+        
+        # Add row labels
+        axes[0, 0].text(-0.3, 0.5, 'Context', transform=axes[0, 0].transAxes, 
+                       fontsize=12, va='center', ha='right', rotation=90, weight='bold')
+        axes[1, 0].text(-0.3, 0.5, 'Predicted', transform=axes[1, 0].transAxes, 
+                       fontsize=12, va='center', ha='right', rotation=90, weight='bold', color='blue')
+        axes[2, 0].text(-0.3, 0.5, 'Ground Truth', transform=axes[2, 0].transAxes, 
+                       fontsize=12, va='center', ha='right', rotation=90, weight='bold', color='green')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(epoch_dir, "rollout_comparison.png"), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+    except Exception as e:
+        print(f"Warning: Could not create rollout comparison grid: {e}")
+
+def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder, cfg, 
+                              past_images, actions, current_images, captions=None): 
+    device, B, N_hist = current_images.device, *past_images.shape[:2]
     if captions is not None:
         assert len(captions) == B
 
-    # Encode target and context 
-    x0 = encode_images_to_latents(vae, current_images, cfg.vae_scaling_factor)  # [B, C, h, w]
-    ctxt = encode_images_to_latents(vae, past_images.flatten(0, 1), cfg.vae_scaling_factor)
-    ctxt = ctxt.reshape(B, N_hist, *x0.shape[1:])  # [B, N_hist, C, h, w]
+    x0 = encode_images_to_latents(vae, current_images, cfg.vae_scaling_factor)
+    ctxt = encode_images_to_latents(vae, past_images.flatten(0, 1), cfg.vae_scaling_factor).reshape(B, N_hist, *x0.shape[1:])
 
-    # Diffusion target: sample t, add noise to current frame only
     timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (B,), device=device, dtype=torch.long)
-    noise = torch.randn_like(x0)
+    noise = torch.randn_like(x0, dtype=x0.dtype)
     x_t = scheduler.add_noise(x0, noise, timesteps)
 
-    # Context 
-    alpha = torch.rand(B, device=device) * cfg.alpha_max  # [B]
-    ctx_noise = torch.randn_like(ctxt)
-    ctxt_noisy = ctxt + alpha.view(B, 1, 1, 1, 1) * ctx_noise
+    alpha = torch.rand(B, device=device) * cfg.alpha_max
+    ctxt_noisy = ctxt + alpha.view(B, 1, 1, 1, 1) * torch.randn_like(ctxt, dtype=ctxt.dtype)
+    bucket_ids = noise_bucketer.bucketize(alpha)
 
-    # Bucketize alpha and get noise-bucket embeddings (to be passed as timestep_cond)
-    bucket_ids = noise_bucketer.bucketize(alpha)  # [B]
+    x_in = torch.cat([x_t, ctxt_noisy.flatten(1, 2)], dim=1)
 
-    # Channel-concat: [x_t || noisy_context_latents]
-    ctxt_cat = ctxt_noisy.flatten(1, 2)  # [B, N_hist*C, h, w]
-    x_in = torch.cat([x_t, ctxt_cat], dim=1)  # [B, C + N_hist*C, h, w]
-
-    # x_in, noise, x0, timesteps, bucket_ids computed above
-
-    caption_embeds = None
-    if caption_encoder is not None and captions is not None:
-        caption_embeds = caption_encoder(captions)
-
+    caption_embeds = caption_encoder(captions) if caption_encoder and captions else None
     action_text_embeds, obs_mask = conditioner(actions, caption_embeds)
-    timestep_cond = noise_bucketer(bucket_ids)  # [B, D]
+    timestep_cond = noise_bucketer(bucket_ids)
 
-    # Standard epsilon-pred loss on current frame only
-    eps = cfg_only_on_observation(
-        unet, x_in, timesteps, action_text_embeds, obs_mask, timestep_cond, cfg.cfg_weight
-    )
-    loss = F.mse_loss(eps, noise)
-    return loss
+    model_output = cfg_only_on_observation(unet, x_in, timesteps, action_text_embeds, obs_mask, timestep_cond, cfg.cfg_weight)
+    
+    if cfg.use_xpred:
+        # X-prediction objective: model directly predicts clean latent x0
+        return F.mse_loss(model_output, x0)
+    else:
+        # Epsilon-prediction objective: model predicts noise
+        return F.mse_loss(model_output, noise)
 
-def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10, lr: float = 1e-4):
+def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10, lr: float = 1e-4, use_xpred: bool = True):
     cfg = DoomSimCfg()
+    cfg.use_xpred = use_xpred
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    wandb.init(
+        project="doom-world-model",
+        name=f"train_{timestamp}",
+        config={
+            "learning_rate": lr,
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "n_hist": cfg.n_hist,
+            "alpha_max": cfg.alpha_max,
+            "k_buckets": cfg.k_buckets,
+            "cfg_weight": cfg.cfg_weight,
+            "num_inference_steps": cfg.num_inference_steps,
+            "lora_r": cfg.lora_r,
+            "lora_alpha": cfg.lora_alpha,
+            "lora_dropout": cfg.lora_dropout,
+            "height": cfg.height,
+            "width": cfg.width,
+            "use_xpred": cfg.use_xpred,
+            "prediction_type": "sample" if cfg.use_xpred else "epsilon",
+        }
+    )
     
     vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder = build_models(cfg, device)
-    
-    # Initialize dataset and dataloader
     train_dataset = DoomDataset(data_dir=data_dir, n_hist=cfg.n_hist, height=cfg.height, width=cfg.width)
-    print(f"Dataset loaded with {len(train_dataset)} episodes")
-    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    
-    # Get model dtype
     model_dtype = next(unet.parameters()).dtype
-    print(f"Model dtype: {model_dtype}")
     
-    # Optimizer for trainable parameters only (vae encoder is frozen)
+    print(f"Dataset: {len(train_dataset)} episodes")
+    
     optimizer = torch.optim.AdamW(
-        list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()),
-        lr=lr
+        list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()), lr=lr
     )
+    
+    rollout_steps = 8
+    test_frames, test_actions = train_dataset.load_episode_frames(idx=0, n_frames=cfg.n_hist + rollout_steps, start_idx=0)
+    test_context = test_frames[:cfg.n_hist].unsqueeze(0).to(device=device, dtype=model_dtype)
+    test_action_seq = test_actions[cfg.n_hist:].unsqueeze(0).to(device=device, dtype=model_dtype)
+    test_gt_frames = test_frames[cfg.n_hist:].unsqueeze(0).to(device=device, dtype=model_dtype)
+    
+    rollout_dir = f"debug/rollouts/{timestamp}"
+    os.makedirs(rollout_dir, exist_ok=True)
+    print(f"Rollouts will be saved to: {rollout_dir}")
     
     for epoch in range(num_epochs):
         total_loss = 0.0
         for batch_idx, (frames, actions) in enumerate(train_loader):
-            # frames: [B, n_hist, 3, H, W]
-            # actions: [B, n_hist, act_dim]
-            frames = frames.to(device=device, dtype=model_dtype)
-            actions = actions.to(device=device, dtype=model_dtype)
-            
-            # Split into context (past) and target (current)
-            past_images = frames[:, :-1]  # [B, n_hist-1, 3, H, W]
-            current_images = frames[:, -1]  # [B, 3, H, W]
-            past_actions = actions[:, :-1]  # [B, n_hist-1, act_dim]
-            
-            if batch_idx == 0:
-                print(f"Debug: frames shape: {frames.shape}, past_images shape: {past_images.shape}, current_images shape: {current_images.shape}")
+            frames, actions = frames.to(device=device, dtype=model_dtype), actions.to(device=device, dtype=model_dtype)
+            past_images, current_images, past_actions = frames[:, :-1], frames[:, -1], actions[:, :-1]
             
             loss = train_step_teacher_forced(
                 vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder,
@@ -465,19 +495,79 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_epochs: int = 10
             
             total_loss += loss.item()
             if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch+1}/{num_epochs}] Batch [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
+                print(f"[{epoch+1}/{num_epochs}] Batch [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
+                wandb.log({"batch_loss": loss.item(), "epoch": epoch + 1, "batch": batch_idx})
         
         avg_loss = total_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{num_epochs}] Average Loss: {avg_loss:.4f}")
+        print(f"[{epoch+1}/{num_epochs}] Average Loss: {avg_loss:.4f}")
+        wandb.log({"epoch_loss": avg_loss, "epoch": epoch + 1})
+        
+        print(f"\nRunning rollout for epoch {epoch+1}...")
+        unet.eval()
+        conditioner.eval()
+        noise_bucketer.eval()
+        
+        with torch.no_grad():
+            predicted_frames = []
+            current_context = test_context.clone()
+            
+            for step in range(rollout_steps):
+                action_expanded = test_action_seq[:, step:step+1].expand(-1, cfg.n_hist - 1, -1)
+                context_frames = current_context[:, -(cfg.n_hist-1):]
+                
+                ctx = encode_images_to_latents(
+                    vae, context_frames.flatten(0, 1), cfg.vae_scaling_factor
+                ).reshape(1, cfg.n_hist - 1, cfg.latent_channels, cfg.height//8, cfg.width//8)
+                
+                action_text_embeds, obs_mask = conditioner(action_expanded, None)
+                timestep_cond = noise_bucketer(torch.zeros(1, dtype=torch.long, device=device))
+                
+                lat = torch.randn(1, cfg.latent_channels, cfg.height // 8, cfg.width // 8, 
+                                 device=device, dtype=model_dtype)
+                scheduler.set_timesteps(cfg.num_inference_steps, device=device)
+                
+                for t in scheduler.timesteps:
+                    x_in = torch.cat([lat, ctx.flatten(1, 2)], dim=1)
+                    x0_pred = cfg_only_on_observation(
+                        unet, x_in, t.expand(1), action_text_embeds, obs_mask, timestep_cond, cfg.cfg_weight
+                    )
+                    lat = scheduler.step(x0_pred, t, lat).prev_sample
+                
+                next_frame = vae.decode(lat / cfg.vae_scaling_factor).sample
+                predicted_frames.append(next_frame)
+                current_context = torch.cat([current_context[:, 1:], next_frame.unsqueeze(1)], dim=1)
+            
+            epoch_dir = os.path.join(rollout_dir, f"epoch_{epoch+1:03d}")
+            os.makedirs(epoch_dir, exist_ok=True)
+            
+            for i in range(cfg.n_hist):
+                frame = (test_context[0, i].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+                Image.fromarray(frame).save(os.path.join(epoch_dir, f"context_{i:02d}.png"))
+            
+            for i, frame in enumerate(predicted_frames):
+                frame_np = (frame[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+                Image.fromarray(frame_np).save(os.path.join(epoch_dir, f"pred_{i:02d}.png"))
+            
+            for i in range(rollout_steps):
+                frame = (test_gt_frames[0, i].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+                Image.fromarray(frame).save(os.path.join(epoch_dir, f"gt_{i:02d}.png"))
+            
+            create_rollout_comparison_grid(epoch_dir, cfg.n_hist, rollout_steps)
+            print(f"Rollout saved to: {epoch_dir}")
+        
+        unet.train()
+        conditioner.train()
+        noise_bucketer.train()
     
-    # Save LoRA adapters
     if cfg.use_lora:
-        save_dir = "checkpoints/doom_lora"
+        save_dir = f"checkpoints/doom_lora/{timestamp}"
         os.makedirs(save_dir, exist_ok=True)
         unet.save_pretrained(f"{save_dir}/unet")
         conditioner.save_pretrained(f"{save_dir}/conditioner")
         noise_bucketer.save_pretrained(f"{save_dir}/noise_bucketer")
-        print(f"\nLoRA adapters saved to {save_dir}/")
+        print(f"LoRA adapters saved to {save_dir}/")
+    
+    wandb.finish()
 
 @torch.no_grad()
 def rollout(
@@ -515,7 +605,9 @@ def rollout(
             vae, context_images.flatten(0, 1), cfg.vae_scaling_factor
         ).reshape(B, N_hist, cfg.latent_channels, H//8, W//8)
 
-        lat = torch.randn(B, cfg.latent_channels, H // 8, W // 8, device=device)
+        # Ensure lat matches the model dtype to avoid dtype mismatches
+        model_dtype = next(unet.parameters()).dtype
+        lat = torch.randn(B, cfg.latent_channels, H // 8, W // 8, device=device, dtype=model_dtype)
         scheduler.set_timesteps(cfg.num_inference_steps, device=device)
 
         for t in scheduler.timesteps:
@@ -523,7 +615,7 @@ def rollout(
             ctx_cat = ctx.flatten(1,2)
             x_in = torch.cat([lat, ctx_cat], dim=1)
             
-            eps = cfg_only_on_observation(
+            x0_pred = cfg_only_on_observation(
                 unet, 
                 x_in, 
                 t.expand(B), 
@@ -532,7 +624,7 @@ def rollout(
                 timestep_cond, 
                 cfg.cfg_weight
             )
-            pred = scheduler.step(eps, t, lat)
+            pred = scheduler.step(x0_pred, t, lat)
             lat = pred.prev_sample
 
         # Decode to image and roll context
@@ -544,11 +636,12 @@ def rollout(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train Doom world model with diffusion + LoRA")
-    parser.add_argument("--data_dir", type=str, default="debug/rnd/20251022_224904", help="Path to episode data directory")
+    parser.add_argument("--data_dir", type=str, default="debug/rnd/20251023_014026", help="Path to episode data directory")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size (use 2 for MPS, 4+ for CUDA)")
-    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--xpred", type=lambda x: x.lower() == 'true', default=True, help="Use X-prediction (sample) if True, else epsilon (noise) prediction (default: True)")
     args = parser.parse_args()
     
-    train(data_dir=args.data_dir, batch_size=args.batch_size, num_epochs=args.num_epochs, lr=args.lr)
+    train(data_dir=args.data_dir, batch_size=args.batch_size, num_epochs=args.epochs, lr=args.lr, use_xpred=args.xpred)
 

@@ -157,7 +157,8 @@ def stack_frames(frame_buffer, new_frame):
 def run_episode(thread_id, agent, fwd_model, err_model, enc_model, buffer, stats, frame_counter,
                 error_ready, save_rgb_debug, device='cpu'):
     game = vzd.DoomGame()
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Look in project root (parent of agents/)
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     wad_path = os.path.join(script_dir, "Doom1.WAD")
     game.set_doom_game_path(wad_path)
     game.set_doom_map("E1M1")
@@ -355,9 +356,12 @@ def init_wandb(config):
 
 if __name__ == '__main__':
     torch.autograd.set_detect_anomaly(True)
-    os.makedirs('debug', exist_ok=True)
+    # Create debug dir in project root
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    debug_base = os.path.join(project_root, 'debug')
+    os.makedirs(debug_base, exist_ok=True)
     from datetime import datetime
-    debug_dir = 'debug/'+datetime.now().strftime('%Y%m%d_%H%M%S')
+    debug_dir = os.path.join(project_root, 'debug', datetime.now().strftime('%Y%m%d_%H%M%S'))
     os.makedirs(debug_dir, exist_ok=True)
 
     wandb_config = {
