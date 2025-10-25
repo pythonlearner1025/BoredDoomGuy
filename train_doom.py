@@ -40,7 +40,7 @@ class DoomSimCfg:
     grad_clip: float = 1.0
     mixed_precision: bool = False
     use_lora: bool = True
-    lora_r: int = 128 
+    lora_r: int = 256 
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     latent_channels: int = 4
@@ -375,8 +375,11 @@ def build_models(cfg: DoomSimCfg, device: torch.device):
     vae = AutoencoderKL.from_pretrained(
         "runwayml/stable-diffusion-v1-5", subfolder="vae", torch_dtype=dtype
     ).to(device)
-    for p in vae.encoder.parameters():
-        p.requires_grad = False
+    
+    # Freeze entire VAE and set to eval mode to prevent memory leaks
+    vae.requires_grad_(False)
+    vae.eval()
+    print("VAE frozen and set to eval mode")
 
     unet = UNet2DConditionModel.from_pretrained(
         "runwayml/stable-diffusion-v1-5", subfolder="unet", torch_dtype=dtype
@@ -566,7 +569,8 @@ def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer,
     ctxt = encode_images_to_latents(vae, past_images.flatten(0, 1), cfg.vae_scaling_factor).reshape(B, N_hist, *x0.shape[1:])
 
     timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (B,), device=device, dtype=torch.long)
-    noise = torch.randn_like(x0, dtype=x0.dtype)
+    # Noise must be detached - it's a target, not part of the computation graph
+    noise = torch.randn_like(x0, dtype=x0.dtype).detach()
     x_t = scheduler.add_noise(x0, noise, timesteps)
 
     alpha = torch.rand(B, device=device) * cfg.alpha_max
@@ -582,8 +586,16 @@ def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer,
     action_text_embeds, obs_mask = conditioner(actions, caption_embeds)
     timestep_cond = noise_bucketer(bucket_ids)
 
-    # Use CFG with context dropout (runs model with and without context, blends results)
-    model_output = cfg_with_context_dropout(unet, x_t, ctxt_noisy, timesteps, action_text_embeds, timestep_cond, cfg.cfg_weight)
+    # During training: simple forward pass without CFG (saves memory)
+    # Context dropout already trains the model for CFG at inference time
+    model_dtype = next(unet.parameters()).dtype
+    x_in = torch.cat([x_t, ctxt_noisy.flatten(1, 2)], dim=1).to(dtype=model_dtype)
+    model_output = unet(
+        sample=x_in, 
+        timestep=timesteps, 
+        encoder_hidden_states=action_text_embeds.to(dtype=model_dtype), 
+        timestep_cond=timestep_cond.to(dtype=model_dtype)
+    ).sample
     
     if cfg.use_xpred:
         # X-prediction objective: model directly predicts clean latent x0
@@ -669,9 +681,14 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
     print(f"Rollouts directory: {rollout_dir}")
     print("="*60 + "\n")
     
-    # Create infinite data iterator
-    from itertools import cycle
-    data_iter = cycle(train_loader)
+    # Create infinite data iterator without caching batches
+    def infinite_dataloader(dataloader):
+        """Infinite iterator that doesn't cache batches (unlike itertools.cycle)."""
+        while True:
+            for batch in dataloader:
+                yield batch
+    
+    data_iter = infinite_dataloader(train_loader)
     
     global_step = 0
     running_loss = 0.0
@@ -689,7 +706,7 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
             cfg, past_images, past_actions, current_images, captions=None
         )
         
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # More memory efficient than setting to zeros
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
             list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()),
@@ -699,6 +716,10 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
         
         global_step += 1
         running_loss += loss.item()
+        
+        # Clear CUDA cache periodically to prevent memory accumulation
+        if global_step % 50 == 0:
+            torch.cuda.empty_cache()
         
         # Log every N steps
         if global_step % log_interval == 0:
