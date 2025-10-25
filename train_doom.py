@@ -23,15 +23,14 @@ from transformers import CLIPTokenizer, CLIPTextModel
 
 @dataclass
 class DoomSimCfg:
-    n_hist: int = 64
+    n_hist: int = 32
     alpha_max: float = 0.7
     k_buckets: int = 10
     cfg_weight: float = 1.5
     num_inference_steps: int = 4
     text_hidden_size: int = 768
-    noise_embed_dim: int = 256
+    noise_embed_dim: int = 320  # Must match UNet's time_embed_input_dim (no adapter)
     action_vocab_size: int = 6
-    action_embed_dim: int = 12
     caption_vocab_size: int = 0
     caption_embed_dim: int = 256
     use_clip_captions: bool = False
@@ -47,8 +46,9 @@ class DoomSimCfg:
     vae_scaling_factor: float = 0.18215
     height: int = 120
     width: int = 160
-    use_xpred: bool = True  # X-prediction (sample) vs epsilon (noise) prediction
+    prediction_type: str = "v_prediction"  # v_prediction (GameNGen paper), epsilon, or sample
     context_dropout_prob: float = 0.1  # Probability of dropping context frames during training for CFG
+    gradient_checkpointing: bool = True  # Enable gradient checkpointing to save VRAM
 
 VALID_ACTIONS = [
     "MOVE_FORWARD",
@@ -278,13 +278,11 @@ class Conditioner(nn.Module):
     def __init__(
         self,
         action_vocab_size: int,
-        action_embed_dim: int,
         out_hidden_size: int,
         dropout: float = 0.0,
     ):
         super().__init__()
         self.action_proj = nn.Linear(action_vocab_size, out_hidden_size)
-        self.out_hidden_size = out_hidden_size
     
     def forward(self, actions: torch.FloatTensor, caption_embeds: Optional[torch.FloatTensor]) -> Tuple[torch.FloatTensor, torch.BoolTensor]:
         # actions: [B, N_hist, action_vocab_size] (one-hot vectors)
@@ -385,23 +383,34 @@ def build_models(cfg: DoomSimCfg, device: torch.device):
         "runwayml/stable-diffusion-v1-5", subfolder="unet", torch_dtype=dtype
     ).to(device)
     
+    # Enable gradient checkpointing to save VRAM (trades compute for memory)
+    if cfg.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+        print("✓ UNet gradient checkpointing enabled (saves ~40% VRAM)")
+    
     in_channels = cfg.latent_channels * (cfg.n_hist - 1)
     total_in_channels = cfg.latent_channels + in_channels
     inflate_conv_in_for_history(unet, old_in=4, new_in=total_in_channels)
     
-    if unet.time_embedding.cond_proj is None:
-        time_embed_input_dim = unet.time_embedding.linear_1.in_features
-        unet.time_embedding.cond_proj = nn.Linear(cfg.noise_embed_dim, time_embed_input_dim).to(device, dtype=dtype)
+    # Verify noise_embed_dim matches UNet's expected time_embed_input_dim
+    time_embed_input_dim = unet.time_embedding.linear_1.in_features
+    if cfg.noise_embed_dim != time_embed_input_dim:
+        raise ValueError(
+            f"noise_embed_dim ({cfg.noise_embed_dim}) must equal UNet's time_embed_input_dim ({time_embed_input_dim}). "
+            f"No adapter layer is used - noise embeddings are plugged directly into UNet."
+        )
     
-    prediction_type = "sample" if cfg.use_xpred else "epsilon"
+    # Initialize cond_proj as identity (no transformation needed)
+    if unet.time_embedding.cond_proj is None:
+        unet.time_embedding.cond_proj = nn.Identity()
+    
     scheduler = DDIMScheduler.from_pretrained(
-        "runwayml/stable-diffusion-v1-5", subfolder="scheduler", prediction_type=prediction_type
+        "runwayml/stable-diffusion-v1-5", subfolder="scheduler", prediction_type=cfg.prediction_type
     )
-    print(f"Using prediction type: {prediction_type}")
+    print(f"Using prediction type: {cfg.prediction_type}")
     
     conditioner = Conditioner(
         action_vocab_size=cfg.action_vocab_size,
-        action_embed_dim=cfg.action_embed_dim,
         out_hidden_size=cfg.text_hidden_size,
     ).to(device, dtype=dtype)
     
@@ -597,16 +606,29 @@ def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer,
         timestep_cond=timestep_cond.to(dtype=model_dtype)
     ).sample
     
-    if cfg.use_xpred:
+    # Compute target based on prediction type
+    if cfg.prediction_type == "v_prediction":
+        # V-prediction (velocity parameterization) - GameNGen paper
+        # v = sqrt(alpha_bar_t) * epsilon - sqrt(1 - alpha_bar_t) * x0
+        # Get alpha_bar_t (cumulative product of alphas) for each timestep
+        alpha_bar_t = scheduler.alphas_cumprod[timesteps].to(device=device, dtype=x0.dtype)
+        # Reshape for broadcasting: [B, 1, 1, 1]
+        alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1)
+        sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
+        v_target = sqrt_alpha_bar_t * noise - sqrt_one_minus_alpha_bar_t * x0
+        return F.mse_loss(model_output, v_target)
+    elif cfg.prediction_type == "sample":
         # X-prediction objective: model directly predicts clean latent x0
         return F.mse_loss(model_output, x0)
-    else:
+    else:  # epsilon
         # Epsilon-prediction objective: model predicts noise
         return F.mse_loss(model_output, noise)
 
-def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 10000, lr: float = 1e-4, use_xpred: bool = True, preload_to_ram: bool = False, rollout_interval: int = 100):
+def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 10000, lr: float = 1e-4, prediction_type: str = "v_prediction", gradient_checkpointing: bool = True, preload_to_ram: bool = False, rollout_interval: int = 100):
     cfg = DoomSimCfg()
-    cfg.use_xpred = use_xpred
+    cfg.prediction_type = prediction_type
+    cfg.gradient_checkpointing = gradient_checkpointing
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
     print(f"Device: {device}")
     
@@ -630,8 +652,8 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
             "lora_dropout": cfg.lora_dropout,
             "height": cfg.height,
             "width": cfg.width,
-            "use_xpred": cfg.use_xpred,
-            "prediction_type": "sample" if cfg.use_xpred else "epsilon",
+            "prediction_type": cfg.prediction_type,
+            "gradient_checkpointing": cfg.gradient_checkpointing,
         }
     )
     
@@ -660,6 +682,8 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
     test_context = test_frames[:cfg.n_hist].unsqueeze(0).to(device=device, dtype=model_dtype)
     test_action_seq = test_actions[cfg.n_hist:].unsqueeze(0).to(device=device, dtype=model_dtype)
     test_gt_frames = test_frames[cfg.n_hist:].unsqueeze(0).to(device=device, dtype=model_dtype)
+    # Initialize action history buffer with the first n_hist actions that produced the initial context
+    test_action_history = test_actions[:cfg.n_hist].unsqueeze(0).to(device=device, dtype=model_dtype)
     
     rollout_dir = f"debug/rollouts/{timestamp}"
     os.makedirs(rollout_dir, exist_ok=True)
@@ -675,7 +699,8 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
     print(f"Context dropout probability: {cfg.context_dropout_prob}")
     print(f"Noise augmentation: alpha_max={cfg.alpha_max}, buckets={cfg.k_buckets}")
     print(f"CFG weight: {cfg.cfg_weight}")
-    print(f"Prediction type: {'X-prediction (sample)' if cfg.use_xpred else 'Epsilon-prediction (noise)'}")
+    print(f"Prediction type: {cfg.prediction_type}")
+    print(f"Gradient checkpointing: {'ENABLED' if cfg.gradient_checkpointing else 'DISABLED'}")
     print(f"Rollout interval: every {rollout_interval} step(s)")
     print(f"Checkpoint save interval: every 1000 steps")
     print(f"Rollouts directory: {rollout_dir}")
@@ -736,34 +761,45 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
             conditioner.eval()
             noise_bucketer.eval()
             
+            # Temporarily disable gradient checkpointing during rollout for speed
+            # (no need to save memory during inference since no gradients)
+            if cfg.gradient_checkpointing:
+                unet.disable_gradient_checkpointing()
+            
             with torch.no_grad():
                 predicted_frames = []
                 current_context = test_context.clone()
-                
+                action_history = test_action_history.clone()
+
                 for step in range(rollout_steps):
-                    action_expanded = test_action_seq[:, step:step+1].expand(-1, cfg.n_hist - 1, -1)
+                    # Use the last n_hist-1 actions (the actual action history for the context frames)
+                    action_context = action_history[:, -(cfg.n_hist-1):]
                     context_frames = current_context[:, -(cfg.n_hist-1):]
-                    
+
                     ctx = encode_images_to_latents(
                         vae, context_frames.flatten(0, 1), cfg.vae_scaling_factor
                     ).reshape(1, cfg.n_hist - 1, cfg.latent_channels, cfg.height//8, cfg.width//8)
-                    
-                    action_text_embeds, obs_mask = conditioner(action_expanded, None)
+
+                    action_text_embeds, obs_mask = conditioner(action_context, None)
                     timestep_cond = noise_bucketer(torch.zeros(1, dtype=torch.long, device=device))
-                    
-                    lat = torch.randn(1, cfg.latent_channels, cfg.height // 8, cfg.width // 8, 
+
+                    lat = torch.randn(1, cfg.latent_channels, cfg.height // 8, cfg.width // 8,
                                      device=device, dtype=model_dtype)
                     scheduler.set_timesteps(cfg.num_inference_steps, device=device)
-                    
+
                     for t in scheduler.timesteps:
                         x0_pred = cfg_with_context_dropout(
                             unet, lat, ctx, t.expand(1), action_text_embeds, timestep_cond, cfg.cfg_weight
                         )
                         lat = scheduler.step(x0_pred, t, lat).prev_sample
-                    
+
                     next_frame = vae.decode(lat / cfg.vae_scaling_factor).sample
                     predicted_frames.append(next_frame)
+
+                    # Roll the buffers: remove oldest, add newest
                     current_context = torch.cat([current_context[:, 1:], next_frame.unsqueeze(1)], dim=1)
+                    next_action = test_action_seq[:, step:step+1]
+                    action_history = torch.cat([action_history[:, 1:], next_action], dim=1)
                 
                 step_dir = os.path.join(rollout_dir, f"step_{global_step:06d}")
                 os.makedirs(step_dir, exist_ok=True)
@@ -782,6 +818,10 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
                 
                 create_rollout_comparison_grid(step_dir, cfg.n_hist, rollout_steps)
                 print(f"Rollout saved to: {step_dir}")
+            
+            # Re-enable gradient checkpointing for training
+            if cfg.gradient_checkpointing:
+                unet.enable_gradient_checkpointing()
             
             unet.train()
             conditioner.train()
@@ -817,7 +857,8 @@ def rollout(
     caption_encoder: Optional[CaptionEncoderCLIP],
     cfg: DoomSimCfg,
     init_context_images: torch.Tensor,  # [B, N_hist, 3, H, W]
-    actions_seq: torch.FloatTensor,     # [B, T_total, action_vocab_size] action one_hot vecs for rollout
+    init_context_actions: torch.FloatTensor,  # [B, N_hist, action_vocab_size] initial action history
+    actions_seq: torch.FloatTensor,     # [B, T_rollout, action_vocab_size] action one_hot vecs for rollout steps
     captions_seq: Optional[torch.LongTensor] = None,  # [B, T_cap] per step or None (legacy)
     caption_texts: Optional[list[str]] = None,        # list[str] for CLIP (kept constant here for simplicity)
     steps: int = 8,
@@ -825,15 +866,17 @@ def rollout(
     device = init_context_images.device
     B, N_hist, _, H, W = init_context_images.shape
 
-    # Maintain a rolling context of decoded frames; re-encode each predicted frame
+    # Maintain rolling buffers for both frames and actions
     context_images = init_context_images.clone()
+    action_history = init_context_actions.clone()
 
     # Prepare fixed timestep_cond representing zero context noise (bucket id 0)
     bucket_ids = torch.zeros(B, dtype=torch.long, device=device)
     timestep_cond = noise_bucketer(bucket_ids)  # [B, D]
 
     for t_idx in range(steps):
-        actions_t = actions_seq[:, t_idx].unsqueeze(1).repeat(1, N_hist, 1)  # [B, N_hist, act_dim]
+        # Use the actual action history (not repeated current action)
+        actions_t = action_history  # [B, N_hist, act_dim]
         caption_embeds = None
         if caption_encoder is not None and caption_texts is not None:
             caption_embeds = caption_encoder(caption_texts)
@@ -850,20 +893,24 @@ def rollout(
 
         for t in scheduler.timesteps:
             x0_pred = cfg_with_context_dropout(
-                unet, 
-                lat, 
+                unet,
+                lat,
                 ctx,
-                t.expand(B), 
-                action_text_embeds, 
-                timestep_cond, 
+                t.expand(B),
+                action_text_embeds,
+                timestep_cond,
                 cfg.cfg_weight
             )
             pred = scheduler.step(x0_pred, t, lat)
             lat = pred.prev_sample
 
-        # Decode to image and roll context
+        # Decode to image and roll both buffers
         image = vae.decode(lat / cfg.vae_scaling_factor).sample  # [B, 3, H, W]
         context_images = torch.cat([context_images[:, 1:], image.unsqueeze(1)], dim=1)
+
+        # Roll action history: add the next action from the sequence
+        next_action = actions_seq[:, t_idx:t_idx+1]
+        action_history = torch.cat([action_history[:, 1:], next_action], dim=1)
 
     return context_images[:, -1]  # last predicted frame
 
@@ -874,10 +921,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size (use 2 for MPS, 4+ for CUDA)")
     parser.add_argument("--steps", type=int, default=10000, help="Number of training steps (paper uses 700,000)")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (paper uses 2e-5)")
-    parser.add_argument("--xpred", type=lambda x: x.lower() == 'true', default=True, help="Use X-prediction (sample) if True, else epsilon (noise) prediction (default: True)")
+    parser.add_argument("--prediction_type", type=str, default="v_prediction", choices=["v_prediction", "epsilon", "sample"], help="Prediction type: v_prediction (GameNGen paper default), epsilon, or sample")
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save VRAM (default: True)")
+    parser.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing", action="store_false", help="Disable gradient checkpointing")
     parser.add_argument("--preload", action="store_true", help="Preload all data to RAM (default: False, load on-demand from disk)")
     parser.add_argument("--rollout_interval", type=int, default=100, help="Run rollout every N steps (default: 100)")
     args = parser.parse_args()
     
-    train(data_dir=args.data_dir, batch_size=args.batch_size, num_steps=args.steps, lr=args.lr, use_xpred=args.xpred, preload_to_ram=args.preload, rollout_interval=args.rollout_interval)
-
+    train(data_dir=args.data_dir, batch_size=args.batch_size, num_steps=args.steps, lr=args.lr, prediction_type=args.prediction_type, gradient_checkpointing=args.gradient_checkpointing, preload_to_ram=args.preload, rollout_interval=args.rollout_interval)
