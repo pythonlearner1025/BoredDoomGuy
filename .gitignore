@@ -13,6 +13,10 @@ vae_*
 
 *.DS_Store
 
+*.png
+*.json
+
+
 *.txt
 !requirements.txt
 test/
