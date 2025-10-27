@@ -20,16 +20,17 @@ from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from transformers import CLIPTokenizer, CLIPTextModel
+from transformers.optimization import Adafactor
 
 @dataclass
 class DoomSimCfg:
-    n_hist: int = 32
+    n_hist: int = 64
     alpha_max: float = 0.7
     k_buckets: int = 10
     cfg_weight: float = 1.5
     num_inference_steps: int = 4
     text_hidden_size: int = 768
-    noise_embed_dim: int = 320  # Must match UNet's time_embed_input_dim (no adapter)
+    noise_embed_dim: int = 256
     action_vocab_size: int = 6
     caption_vocab_size: int = 0
     caption_embed_dim: int = 256
@@ -39,7 +40,7 @@ class DoomSimCfg:
     grad_clip: float = 1.0
     mixed_precision: bool = False
     use_lora: bool = True
-    lora_r: int = 256 
+    lora_r: int = 1024 
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     latent_channels: int = 4
@@ -70,7 +71,7 @@ def _load_single_episode(ep_path: str, width: int, height: int):
     """Load a single episode from disk."""
     try:
         frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
-        json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
+        json_files = sorted([f for f in os.listdir(ep_path) if f.startswith("frame_") and f.endswith(".json")])
         
         frames, actions = [], []
         for frame_file, json_file in zip(frame_files, json_files):
@@ -106,17 +107,19 @@ class DoomDataset(Dataset):
         self.height = height
         self.width = width
         
-        # Find all episodes
-        
-        # Find all episodes
+        # Find all episodes (exclude hidden directories like .cache)
         self.episode_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
-                             if os.path.isdir(os.path.join(data_dir, f))]
+                             if os.path.isdir(os.path.join(data_dir, f)) and not f.startswith('.')]
         self.episode_paths.sort()
         
         print(f"Loading {len(self.episode_paths)} episodes from {data_dir}...")
         
         # Preload all data into RAM for maximum efficiency
         self.episodes_data = []  # List of (frames_tensor, actions_tensor) tuples
+        
+        # Always compute episode lengths as fallback (needed if preload fails)
+        self.episode_lengths = [len([f for f in os.listdir(ep) if f.endswith(".png")]) 
+                               for ep in self.episode_paths]
         
         if preload_to_ram:
             # Sequential loading on single CPU
@@ -132,13 +135,8 @@ class DoomDataset(Dataset):
                 print(f"⚠ Warning: {len(self.episode_paths) - len(self.episodes_data)} episodes failed to load")
             
             print(f"✓ Preloading complete! {len(self.episodes_data)} episodes are in RAM.")
-        else:
-            # Just store paths and compute lengths
-            self.episode_lengths = [len([f for f in os.listdir(ep) if f.endswith(".png")]) 
-                                   for ep in self.episode_paths]
     
     def __len__(self):
-        return len(self.episodes_data) if self.episodes_data else len(self.episode_paths)
         return len(self.episodes_data) if self.episodes_data else len(self.episode_paths)
     
     def load_episode_frames(self, idx: int, n_frames: int, start_idx: int = 0):
@@ -167,48 +165,7 @@ class DoomDataset(Dataset):
             
             frames, actions = [], []
             frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
-            json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
-            
-            for i in range(start_idx, start_idx + actual_n_frames):
-                img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
-                img = img.resize((self.width, self.height), Image.BILINEAR)
-                frames.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
-                
-                with open(os.path.join(ep_path, json_files[i]), "r") as f:
-                    buttons = json.load(f)["action"]["buttons"]
-                    actions.append(buttons_to_action_one_hot(buttons))
-            
-            while len(frames) < n_frames:
-                frames.append(torch.zeros(3, self.height, self.width))
-                actions.append(torch.zeros(len(VALID_ACTIONS)))
-            
-            return torch.stack(frames), torch.stack(actions)
-        """Load specific frames from an episode (used for test/validation)."""
-        if self.episodes_data:
-            # Use preloaded data
-            frames_all, actions_all = self.episodes_data[idx]
-            ep_len = len(frames_all)
-            actual_n_frames = min(n_frames, ep_len - start_idx)
-            
-            frames = frames_all[start_idx:start_idx + actual_n_frames]
-            actions = actions_all[start_idx:start_idx + actual_n_frames]
-            
-            # Pad if needed
-            if len(frames) < n_frames:
-                pad_frames = torch.zeros(n_frames - len(frames), 3, self.height, self.width)
-                pad_actions = torch.zeros(n_frames - len(frames), len(VALID_ACTIONS))
-                frames = torch.cat([frames, pad_frames], dim=0)
-                actions = torch.cat([actions, pad_actions], dim=0)
-            
-            return frames, actions
-        else:
-            # Fallback to disk loading
-            ep_path = self.episode_paths[idx]
-            actual_n_frames = min(n_frames, self.episode_lengths[idx] - start_idx)
-            
-            frames, actions = [], []
-            frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
-            json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
+            json_files = sorted([f for f in os.listdir(ep_path) if f.startswith("frame_") and f.endswith(".json")])
             
             for i in range(start_idx, start_idx + actual_n_frames):
                 img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
@@ -256,7 +213,7 @@ class DoomDataset(Dataset):
             
             frames, actions = [], []
             frame_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".png")])
-            json_files = sorted([f for f in os.listdir(ep_path) if f.endswith(".json")])
+            json_files = sorted([f for f in os.listdir(ep_path) if f.startswith("frame_") and f.endswith(".json")])
             
             for i in range(start_idx, start_idx + actual_n_hist):
                 img = Image.open(os.path.join(ep_path, frame_files[i])).convert("RGB")
@@ -392,17 +349,9 @@ def build_models(cfg: DoomSimCfg, device: torch.device):
     total_in_channels = cfg.latent_channels + in_channels
     inflate_conv_in_for_history(unet, old_in=4, new_in=total_in_channels)
     
-    # Verify noise_embed_dim matches UNet's expected time_embed_input_dim
-    time_embed_input_dim = unet.time_embedding.linear_1.in_features
-    if cfg.noise_embed_dim != time_embed_input_dim:
-        raise ValueError(
-            f"noise_embed_dim ({cfg.noise_embed_dim}) must equal UNet's time_embed_input_dim ({time_embed_input_dim}). "
-            f"No adapter layer is used - noise embeddings are plugged directly into UNet."
-        )
-    
-    # Initialize cond_proj as identity (no transformation needed)
     if unet.time_embedding.cond_proj is None:
-        unet.time_embedding.cond_proj = nn.Identity()
+        time_embed_input_dim = unet.time_embedding.linear_1.in_features
+        unet.time_embedding.cond_proj = nn.Linear(cfg.noise_embed_dim, time_embed_input_dim).to(device, dtype=dtype)
     
     scheduler = DDIMScheduler.from_pretrained(
         "runwayml/stable-diffusion-v1-5", subfolder="scheduler", prediction_type=cfg.prediction_type
@@ -463,8 +412,13 @@ def build_models(cfg: DoomSimCfg, device: torch.device):
     return vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder
 
 def encode_images_to_latents(vae: AutoencoderKL, images: torch.Tensor, scaling_factor: float) -> torch.Tensor:
-    images = images.to(device=vae.device, dtype=next(vae.parameters()).dtype)
+    images = (images * 2 - 1).to(device=vae.device, dtype=next(vae.parameters()).dtype)
     return vae.encode(images).latent_dist.sample() * scaling_factor
+
+def decode_latents_to_images(vae: AutoencoderKL, latents: torch.Tensor, scaling_factor: float) -> torch.Tensor:
+    imgs = vae.decode(latents / scaling_factor).sample
+    imgs = (imgs / 2 + 0.5).clamp(0, 1)
+    return imgs
 
 def cfg_with_context_dropout(unet, x_noisy, context_latents, t, enc_states, timestep_cond, cfg_weight):
     """
@@ -625,7 +579,7 @@ def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer,
         # Epsilon-prediction objective: model predicts noise
         return F.mse_loss(model_output, noise)
 
-def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 10000, lr: float = 1e-4, prediction_type: str = "v_prediction", gradient_checkpointing: bool = True, preload_to_ram: bool = False, rollout_interval: int = 100):
+def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 10000, lr: float = 5e-5, prediction_type: str = "v_prediction", gradient_checkpointing: bool = True, preload_to_ram: bool = False, rollout_interval: int = 100, use_adafactor: bool = False, use_cosine_decay: bool = False, warmup_steps: int = 0, hold_steps: int = 0):
     cfg = DoomSimCfg()
     cfg.prediction_type = prediction_type
     cfg.gradient_checkpointing = gradient_checkpointing
@@ -641,6 +595,9 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
             "learning_rate": lr,
             "batch_size": batch_size,
             "num_steps": num_steps,
+            "warmup_steps": warmup_steps,
+            "hold_steps": hold_steps,
+            "use_cosine_decay": use_cosine_decay,
             "n_hist": cfg.n_hist,
             "alpha_max": cfg.alpha_max,
             "k_buckets": cfg.k_buckets,
@@ -673,18 +630,61 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
     
     model_dtype = next(unet.parameters()).dtype
     
-    optimizer = torch.optim.AdamW(
-        list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()), lr=lr
-    )
+    # Use Adafactor optimizer (memory-efficient alternative to AdamW)
+    if use_adafactor:
+        optimizer = Adafactor(
+            list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()),
+            lr=lr,
+            scale_parameter=True,  # Scale learning rate by RMS of parameters
+            relative_step=False,   # Use fixed learning rate (not adaptive)
+            warmup_init=False,      # No warmup phase
+            weight_decay=0.0,       # No weight decay
+            decay_mode="cosine",   # Cosine decay
+            max_grad_norm=1.0,     # No gradient clipping
+            lr_scheduler="constant",  # No learning rate scheduler
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            list(unet.parameters()) + list(conditioner.parameters()) + list(noise_bucketer.parameters()), lr=lr
+        )
+
+    lr_scheduler = None
+    if use_cosine_decay or warmup_steps > 0 or hold_steps > 0:
+        def lr_lambda(step):
+            """
+            LR schedule with three phases:
+            1. Warmup: [0, warmup_steps] - linear from 0 to target lr (lr parameter)
+            2. Hold: [warmup_steps, warmup_steps + hold_steps] - constant at target lr
+            3. Decay: [warmup_steps + hold_steps, num_steps] - cosine decay from target lr to 0
+            """
+            if step < warmup_steps:
+                # Warmup phase: linear warmup from 0 to 1.0 (target lr)
+                return float(step) / float(max(1, warmup_steps))
+            elif step < warmup_steps + hold_steps:
+                # Hold phase: constant at target lr
+                return 1.0
+            else:
+                # Cosine decay phase: from target lr to 0
+                if not use_cosine_decay:
+                    # If no cosine decay requested, stay at target lr
+                    return 1.0
+                decay_steps = num_steps - (warmup_steps + hold_steps)
+                progress = (step - warmup_steps - hold_steps) / float(max(1, decay_steps))
+                # Cosine annealing from lr to 0
+                cosine_decay = 0.5 * (1.0 + np.cos(np.pi * progress))
+                return cosine_decay
+        
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     rollout_steps = 8
     test_frames, test_actions = train_dataset.load_episode_frames(idx=0, n_frames=cfg.n_hist + rollout_steps, start_idx=0)
+    # save the first test_frames to check if it is all black or not
     test_context = test_frames[:cfg.n_hist].unsqueeze(0).to(device=device, dtype=model_dtype)
     test_action_seq = test_actions[cfg.n_hist:].unsqueeze(0).to(device=device, dtype=model_dtype)
     test_gt_frames = test_frames[cfg.n_hist:].unsqueeze(0).to(device=device, dtype=model_dtype)
     # Initialize action history buffer with the first n_hist actions that produced the initial context
     test_action_history = test_actions[:cfg.n_hist].unsqueeze(0).to(device=device, dtype=model_dtype)
-    
+
     rollout_dir = f"debug/rollouts/{timestamp}"
     os.makedirs(rollout_dir, exist_ok=True)
     
@@ -694,7 +694,19 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
     print(f"Dataset: {len(train_dataset)} episodes")
     print(f"Batch size: {batch_size}")
     print(f"Total training steps: {num_steps}")
-    print(f"Learning rate: {lr} (constant)")
+    if lr_scheduler is not None:
+        schedule_desc = []
+        if warmup_steps > 0:
+            schedule_desc.append(f"warmup to {lr:.2e} over {warmup_steps} steps")
+        else:
+            schedule_desc.append(f"start at {lr:.2e}")
+        if hold_steps > 0:
+            schedule_desc.append(f"hold for {hold_steps} steps")
+        if use_cosine_decay:
+            schedule_desc.append(f"cosine decay to 0")
+        print(f"Learning rate schedule: {' → '.join(schedule_desc)}")
+    else:
+        print(f"Learning rate: {lr:.2e} (constant)")
     print(f"Context length (n_hist): {cfg.n_hist}")
     print(f"Context dropout probability: {cfg.context_dropout_prob}")
     print(f"Noise augmentation: alpha_max={cfg.alpha_max}, buckets={cfg.k_buckets}")
@@ -739,12 +751,12 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
         )
         optimizer.step()
         
+        # Step LR scheduler after each optimizer step (important for warmup/rampup)
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+        
         global_step += 1
         running_loss += loss.item()
-        
-        # Clear CUDA cache periodically to prevent memory accumulation
-        if global_step % 50 == 0:
-            torch.cuda.empty_cache()
         
         # Log every N steps
         if global_step % log_interval == 0:
@@ -773,6 +785,7 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
 
                 for step in range(rollout_steps):
                     # Use the last n_hist-1 actions (the actual action history for the context frames)
+                    # Decode the action history to get the actual actions
                     action_context = action_history[:, -(cfg.n_hist-1):]
                     context_frames = current_context[:, -(cfg.n_hist-1):]
 
@@ -793,7 +806,7 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
                         )
                         lat = scheduler.step(x0_pred, t, lat).prev_sample
 
-                    next_frame = vae.decode(lat / cfg.vae_scaling_factor).sample
+                    next_frame = decode_latents_to_images(vae, lat, cfg.vae_scaling_factor)
                     predicted_frames.append(next_frame)
 
                     # Roll the buffers: remove oldest, add newest
@@ -822,11 +835,11 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
             # Re-enable gradient checkpointing for training
             if cfg.gradient_checkpointing:
                 unet.enable_gradient_checkpointing()
-            
+
             unet.train()
             conditioner.train()
             noise_bucketer.train()
-        
+
         # Save checkpoint every 1000 steps
         if global_step % 1000 == 0 and cfg.use_lora:
             ckpt_dir = f"checkpoints/doom_lora/{timestamp}/step_{global_step:06d}"
@@ -905,7 +918,7 @@ def rollout(
             lat = pred.prev_sample
 
         # Decode to image and roll both buffers
-        image = vae.decode(lat / cfg.vae_scaling_factor).sample  # [B, 3, H, W]
+        image = decode_latents_to_images(vae, lat, cfg.vae_scaling_factor)  # [B, 3, H, W]
         context_images = torch.cat([context_images[:, 1:], image.unsqueeze(1)], dim=1)
 
         # Roll action history: add the next action from the sequence
@@ -917,15 +930,19 @@ def rollout(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train Doom world model with diffusion + LoRA")
-    parser.add_argument("--data_dir", type=str, default="debug/rnd/20251023_014026", help="Path to episode data directory")
+    parser.add_argument("--data_dir", type=str, default="debug/rnd/20251023_150242", help="Path to episode data directory")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size (use 2 for MPS, 4+ for CUDA)")
     parser.add_argument("--steps", type=int, default=10000, help="Number of training steps (paper uses 700,000)")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (paper uses 2e-5)")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Target learning rate (default: 5e-5, paper uses 2e-5)")
     parser.add_argument("--prediction_type", type=str, default="v_prediction", choices=["v_prediction", "epsilon", "sample"], help="Prediction type: v_prediction (GameNGen paper default), epsilon, or sample")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save VRAM (default: True)")
     parser.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing", action="store_false", help="Disable gradient checkpointing")
     parser.add_argument("--preload", action="store_true", help="Preload all data to RAM (default: False, load on-demand from disk)")
     parser.add_argument("--rollout_interval", type=int, default=100, help="Run rollout every N steps (default: 100)")
+    parser.add_argument("--use_cosine_decay", action="store_true", default=False, help="Use cosine decay for learning rate after warmup/hold (default: False)")
+    parser.add_argument("--use_adafactor", action="store_true", default=False, help="Use Adafactor optimizer (default: False, use AdamW)")
+    parser.add_argument("--warmup_steps", type=int, default=0, help="Number of warmup steps (linear warmup from 0 to target LR)")
+    parser.add_argument("--hold_steps", type=int, default=0, help="Number of steps to hold at target LR before decay")
     args = parser.parse_args()
     
-    train(data_dir=args.data_dir, batch_size=args.batch_size, num_steps=args.steps, lr=args.lr, prediction_type=args.prediction_type, gradient_checkpointing=args.gradient_checkpointing, preload_to_ram=args.preload, rollout_interval=args.rollout_interval)
+    train(data_dir=args.data_dir, batch_size=args.batch_size, num_steps=args.steps, lr=args.lr, prediction_type=args.prediction_type, gradient_checkpointing=args.gradient_checkpointing, preload_to_ram=args.preload, rollout_interval=args.rollout_interval, use_adafactor=args.use_adafactor, use_cosine_decay=args.use_cosine_decay, warmup_steps=args.warmup_steps, hold_steps=args.hold_steps)
