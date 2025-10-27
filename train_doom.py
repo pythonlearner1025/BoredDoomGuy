@@ -408,6 +408,14 @@ def build_models(cfg: DoomSimCfg, device: torch.device):
         )
         noise_bucketer = get_peft_model(noise_bucketer, noise_bucketer_lora_config)
         print("NoiseBucketer LoRA applied")
+    else:
+        print("Full fine-tuning mode: unfreezing all trainable parameters...")
+        # Unfreeze UNet for full fine-tuning
+        unet.requires_grad_(True)
+        # Conditioner and noise_bucketer are already trainable by default
+        total_params = sum(p.numel() for p in unet.parameters())
+        trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+        print(f"UNet: {trainable_params:,} / {total_params:,} parameters trainable ({100 * trainable_params / total_params:.2f}%)")
 
     return vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder
 
@@ -579,10 +587,11 @@ def train_step_teacher_forced(vae, unet, scheduler, conditioner, noise_bucketer,
         # Epsilon-prediction objective: model predicts noise
         return F.mse_loss(model_output, noise)
 
-def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 10000, lr: float = 5e-5, prediction_type: str = "v_prediction", gradient_checkpointing: bool = True, preload_to_ram: bool = False, rollout_interval: int = 100, use_adafactor: bool = False, use_cosine_decay: bool = False, warmup_steps: int = 0, hold_steps: int = 0):
+def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 10000, lr: float = 5e-5, prediction_type: str = "v_prediction", gradient_checkpointing: bool = True, preload_to_ram: bool = False, rollout_interval: int = 100, use_adafactor: bool = False, use_cosine_decay: bool = False, warmup_steps: int = 0, hold_steps: int = 0, full_ft: bool = False):
     cfg = DoomSimCfg()
     cfg.prediction_type = prediction_type
     cfg.gradient_checkpointing = gradient_checkpointing
+    cfg.use_lora = not full_ft  # Use LoRA unless full fine-tuning is requested
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
     print(f"Device: {device}")
     
@@ -598,6 +607,8 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
             "warmup_steps": warmup_steps,
             "hold_steps": hold_steps,
             "use_cosine_decay": use_cosine_decay,
+            "full_ft": full_ft,
+            "use_lora": cfg.use_lora,
             "n_hist": cfg.n_hist,
             "alpha_max": cfg.alpha_max,
             "k_buckets": cfg.k_buckets,
@@ -691,6 +702,7 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
     print("\n" + "="*60)
     print("TRAINING CONFIGURATION")
     print("="*60)
+    print(f"Training mode: {'Full Fine-Tuning' if full_ft else f'LoRA (r={cfg.lora_r}, alpha={cfg.lora_alpha})'}")
     print(f"Dataset: {len(train_dataset)} episodes")
     print(f"Batch size: {batch_size}")
     print(f"Total training steps: {num_steps}")
@@ -841,13 +853,25 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
             noise_bucketer.train()
 
         # Save checkpoint every 1000 steps
-        if global_step % 1000 == 0 and cfg.use_lora:
-            ckpt_dir = f"checkpoints/doom_lora/{timestamp}/step_{global_step:06d}"
-            os.makedirs(ckpt_dir, exist_ok=True)
-            unet.save_pretrained(f"{ckpt_dir}/unet")
-            conditioner.save_pretrained(f"{ckpt_dir}/conditioner")
-            noise_bucketer.save_pretrained(f"{ckpt_dir}/noise_bucketer")
-            print(f"✓ Checkpoint saved at step {global_step}: {ckpt_dir}/")
+        if global_step % 1000 == 0:
+            if cfg.use_lora:
+                ckpt_dir = f"checkpoints/doom_lora/{timestamp}/step_{global_step:06d}"
+                os.makedirs(ckpt_dir, exist_ok=True)
+                unet.save_pretrained(f"{ckpt_dir}/unet")
+                conditioner.save_pretrained(f"{ckpt_dir}/conditioner")
+                noise_bucketer.save_pretrained(f"{ckpt_dir}/noise_bucketer")
+                print(f"✓ LoRA checkpoint saved at step {global_step}: {ckpt_dir}/")
+            else:
+                ckpt_dir = f"checkpoints/doom_full/{timestamp}/step_{global_step:06d}"
+                os.makedirs(ckpt_dir, exist_ok=True)
+                torch.save({
+                    'unet': unet.state_dict(),
+                    'conditioner': conditioner.state_dict(),
+                    'noise_bucketer': noise_bucketer.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'global_step': global_step,
+                }, f"{ckpt_dir}/checkpoint.pt")
+                print(f"✓ Full FT checkpoint saved at step {global_step}: {ckpt_dir}/")
     
     # Save final checkpoint
     if cfg.use_lora:
@@ -856,7 +880,18 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
         unet.save_pretrained(f"{save_dir}/unet")
         conditioner.save_pretrained(f"{save_dir}/conditioner")
         noise_bucketer.save_pretrained(f"{save_dir}/noise_bucketer")
-        print(f"✓ Final checkpoint saved to {save_dir}/")
+        print(f"✓ Final LoRA checkpoint saved to {save_dir}/")
+    else:
+        save_dir = f"checkpoints/doom_full/{timestamp}/final"
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save({
+            'unet': unet.state_dict(),
+            'conditioner': conditioner.state_dict(),
+            'noise_bucketer': noise_bucketer.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'global_step': global_step,
+        }, f"{save_dir}/checkpoint.pt")
+        print(f"✓ Final full FT checkpoint saved to {save_dir}/")
     
     wandb.finish()
 
@@ -943,6 +978,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_adafactor", action="store_true", default=False, help="Use Adafactor optimizer (default: False, use AdamW)")
     parser.add_argument("--warmup_steps", type=int, default=0, help="Number of warmup steps (linear warmup from 0 to target LR)")
     parser.add_argument("--hold_steps", type=int, default=0, help="Number of steps to hold at target LR before decay")
+    parser.add_argument("--full_ft", action="store_true", default=False, help="Use full fine-tuning instead of LoRA (default: False, use LoRA)")
     args = parser.parse_args()
     
-    train(data_dir=args.data_dir, batch_size=args.batch_size, num_steps=args.steps, lr=args.lr, prediction_type=args.prediction_type, gradient_checkpointing=args.gradient_checkpointing, preload_to_ram=args.preload, rollout_interval=args.rollout_interval, use_adafactor=args.use_adafactor, use_cosine_decay=args.use_cosine_decay, warmup_steps=args.warmup_steps, hold_steps=args.hold_steps)
+    train(data_dir=args.data_dir, batch_size=args.batch_size, num_steps=args.steps, lr=args.lr, prediction_type=args.prediction_type, gradient_checkpointing=args.gradient_checkpointing, preload_to_ram=args.preload, rollout_interval=args.rollout_interval, use_adafactor=args.use_adafactor, use_cosine_decay=args.use_cosine_decay, warmup_steps=args.warmup_steps, hold_steps=args.hold_steps, full_ft=args.full_ft)
