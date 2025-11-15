@@ -1,66 +1,78 @@
 import argparse
+import json
 import os
 import torch
 import numpy as np
 from PIL import Image
 import cv2
 
+from utils import encode_images_to_latents, decode_latents_to_images
 from train_doom import (
-    DoomSimCfg, build_models, encode_images_to_latents, 
-    cfg_only_on_observation, VALID_ACTIONS, buttons_to_action_one_hot
+    DoomSimCfg, build_models,
+    cfg_with_context_dropout, VALID_ACTIONS, buttons_to_action_one_hot
 )
-from peft import PeftModel
 
 def load_checkpoint(ckpt_dir, device):
-    """Load models and LoRA adapters from checkpoint."""
     cfg = DoomSimCfg()
-    
-    # Build models WITHOUT LoRA first
-    cfg_no_lora = DoomSimCfg()
-    cfg_no_lora.use_lora = False
-    vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder = build_models(cfg_no_lora, device)
-    
-    # Now load the trained LoRA adapters
-    print(f"Loading LoRA adapters from {ckpt_dir}...")
-    unet = PeftModel.from_pretrained(unet, os.path.join(ckpt_dir, "unet"))
-    conditioner = PeftModel.from_pretrained(conditioner, os.path.join(ckpt_dir, "conditioner"))
-    noise_bucketer = PeftModel.from_pretrained(noise_bucketer, os.path.join(ckpt_dir, "noise_bucketer"))
-    
-    print("LoRA adapters loaded successfully!")
-    
+
+    # Load full weights checkpoint
+    print(f"Loading full weights from {ckpt_dir}/checkpoint.pt...")
+
+    # Build models with full fine-tuning mode
+    cfg_full = DoomSimCfg()
+    cfg_full.use_lora = False
+    vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder = build_models(cfg_full, device)
+
+    # Load checkpoint
+    checkpoint_path = os.path.join(ckpt_dir, "checkpoint.pt")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Load state dicts
+    unet.load_state_dict(checkpoint['unet'])
+    conditioner.load_state_dict(checkpoint['conditioner'])
+    noise_bucketer.load_state_dict(checkpoint['noise_bucketer'])
+
+    print(f"Full weights loaded successfully! (Step {checkpoint.get('step', 'unknown')})")
+
     unet.eval()
     conditioner.eval()
     noise_bucketer.eval()
-    
+
     return vae, unet, scheduler, conditioner, noise_bucketer, cfg
 
-def predict_next_frame(vae, unet, scheduler, conditioner, noise_bucketer, cfg, 
-                       context_frames, action, device, model_dtype):
-    """Predict next frame given context and action."""
+def predict_next_frame(vae, unet, scheduler, conditioner, noise_bucketer, cfg,
+                       context_frames, action_history, device, model_dtype):
+    """Predict next frame given context and action history.
+
+    Args:
+        context_frames: [1, N_hist, 3, H, W] - image context
+        action_history: [1, N_hist, action_vocab_size] - action history buffer
+    """
     with torch.no_grad():
-        # Encode context
+        # Use last N_hist-1 frames and actions (matching training rollout lines 803-808)
+        context_for_encoding = context_frames[:, -(cfg.n_hist - 1):]  # [1, N_hist-1, 3, H, W]
+        action_context = action_history[:, -(cfg.n_hist - 1):]  # [1, N_hist-1, action_vocab_size]
+
         ctx = encode_images_to_latents(
-            vae, context_frames.flatten(0, 1), cfg.vae_scaling_factor
+            vae, context_for_encoding.flatten(0, 1), cfg.vae_scaling_factor
         ).reshape(1, cfg.n_hist - 1, cfg.latent_channels, cfg.height//8, cfg.width//8)
-        
-        # Get action conditioning
-        action_expanded = action.unsqueeze(0).unsqueeze(0).expand(-1, cfg.n_hist - 1, -1)
-        action_text_embeds, obs_mask = conditioner(action_expanded, None)
+
+        # Get action conditioning using N_hist-1 actions (matching training)
+        action_text_embeds, obs_mask = conditioner(action_context, None)
         timestep_cond = noise_bucketer(torch.zeros(1, dtype=torch.long, device=device))
-        
+
         # Denoise
-        lat = torch.randn(1, cfg.latent_channels, cfg.height // 8, cfg.width // 8, 
+        lat = torch.randn(1, cfg.latent_channels, cfg.height // 8, cfg.width // 8,
                          device=device, dtype=model_dtype)
         scheduler.set_timesteps(cfg.num_inference_steps, device=device)
-        
+
         for t in scheduler.timesteps:
-            x_in = torch.cat([lat, ctx.flatten(1, 2)], dim=1)
-            eps = cfg_only_on_observation(
-                unet, x_in, t.expand(1), action_text_embeds, obs_mask, timestep_cond, cfg.cfg_weight
+            eps = cfg_with_context_dropout(
+                unet, lat, ctx, t.expand(1), action_text_embeds, timestep_cond, cfg.cfg_weight
             )
             lat = scheduler.step(eps, t, lat).prev_sample
-        
-        next_frame = vae.decode(lat / cfg.vae_scaling_factor).sample
+
+        next_frame = decode_latents_to_images(vae, lat, cfg.vae_scaling_factor)
         return next_frame
 
 def main():
@@ -69,30 +81,49 @@ def main():
     parser.add_argument("--episode", type=str, default="debug/rnd/20251023_014026/0", help="Path to episode directory (e.g., debug/rnd/20251023_014026/0)")
     parser.add_argument("--start_frame", type=int, default=0, help="Starting frame index in episode")
     args = parser.parse_args()
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    
+
     vae, unet, scheduler, conditioner, noise_bucketer, cfg = load_checkpoint(args.ckpt, device)
     model_dtype = next(unet.parameters()).dtype
     
     # Load initial context from real episode
     print(f"Loading {cfg.n_hist} frames from {args.episode} starting at frame {args.start_frame}")
     frame_files = sorted([f for f in os.listdir(args.episode) if f.endswith(".png")])
+    json_files = sorted([
+        f for f in os.listdir(args.episode)
+        if f.startswith("frame_") and f.endswith(".json")
+    ])
     
     if len(frame_files) < args.start_frame + cfg.n_hist:
         print(f"Error: Not enough frames in episode. Need {args.start_frame + cfg.n_hist}, got {len(frame_files)}")
         return
+
+    if len(json_files) < args.start_frame + cfg.n_hist:
+        print(
+            "Error: Not enough action annotations in episode. "
+            f"Need {args.start_frame + cfg.n_hist}, got {len(json_files)}"
+        )
+        return
     
     context = []
+    actions = []
     for i in range(args.start_frame, args.start_frame + cfg.n_hist):
         img = Image.open(os.path.join(args.episode, frame_files[i])).convert("RGB")
         img = img.resize((cfg.width, cfg.height), Image.BILINEAR)
         context.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0)
+
+        with open(os.path.join(args.episode, json_files[i]), "r") as f:
+            buttons = json.load(f)["action"].get("buttons", [])
+        actions.append(buttons_to_action_one_hot(buttons))
     
     context = torch.stack(context).unsqueeze(0).to(device=device, dtype=model_dtype)
+    action_history = torch.stack(actions).unsqueeze(0).to(device=device, dtype=model_dtype)
     print(f"Loaded context from frames {args.start_frame} to {args.start_frame + cfg.n_hist - 1}")
-    
+
+    print(f"Loaded action history buffer: {action_history.shape}")
+
     print("\nControls:")
     print("  w - MOVE_FORWARD")
     print("  s - MOVE_BACKWARD")
@@ -102,9 +133,9 @@ def main():
     print("  e - USE")
     print("  q - QUIT")
     print("\nPress any key to start...")
-    
+
     cv2.namedWindow("Doom World Model", cv2.WINDOW_NORMAL)
-    
+
     step = 0
     while True:
         # Display current frame
@@ -140,19 +171,20 @@ def main():
             continue
         
         print(f"Step {step}: {action_buttons}")
-        
+
         # Convert to one-hot
         action = buttons_to_action_one_hot(action_buttons).to(device=device, dtype=model_dtype)
-        
-        # Predict next frame
-        context_for_pred = context[:, -(cfg.n_hist-1):]
+
+        # Predict next frame using full context and action history
         next_frame = predict_next_frame(
             vae, unet, scheduler, conditioner, noise_bucketer, cfg,
-            context_for_pred, action, device, model_dtype
+            context, action_history, device, model_dtype
         )
-        
-        # Update context
+
+        # Roll both buffers (just like in train_doom.py rollout function)
         context = torch.cat([context[:, 1:], next_frame.unsqueeze(1)], dim=1)
+        action_history = torch.cat([action_history[:, 1:], action.unsqueeze(0).unsqueeze(0)], dim=1)
+
         step += 1
     
     cv2.destroyAllWindows()
