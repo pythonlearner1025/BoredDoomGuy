@@ -596,48 +596,58 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
     print(f"Device: {device}")
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    wandb.init(
-        project="doom-world-model",
-        name=f"train_{timestamp}",
-        config={
-            "learning_rate": lr,
-            "batch_size": batch_size,
-            "num_steps": num_steps,
-            "warmup_steps": warmup_steps,
-            "hold_steps": hold_steps,
-            "use_cosine_decay": use_cosine_decay,
-            "full_ft": full_ft,
-            "use_lora": cfg.use_lora,
-            "n_hist": cfg.n_hist,
-            "alpha_max": cfg.alpha_max,
-            "k_buckets": cfg.k_buckets,
-            "cfg_weight": cfg.cfg_weight,
-            "context_dropout_prob": cfg.context_dropout_prob,
-            "num_inference_steps": cfg.num_inference_steps,
-            "lora_r": cfg.lora_r,
-            "lora_alpha": cfg.lora_alpha,
-            "lora_dropout": cfg.lora_dropout,
-            "height": cfg.height,
-            "width": cfg.width,
-            "prediction_type": cfg.prediction_type,
-            "gradient_checkpointing": cfg.gradient_checkpointing,
-        }
-    )
-    
+
+    # Disable wandb completely to avoid wandb-core crashes
+    os.environ['WANDB_DISABLED'] = 'true'
+
+    # Skip wandb entirely - it's broken on this system
+    print("Warning: wandb logging disabled")
+    # try:
+    #     wandb.init(
+    #         mode='disabled',
+    #         project="doom-world-model",
+    #         name=f"train_{timestamp}",
+    #         config={
+    #         "learning_rate": lr,
+    #         "batch_size": batch_size,
+    #         "num_steps": num_steps,
+    #         "warmup_steps": warmup_steps,
+    #         "hold_steps": hold_steps,
+    #         "use_cosine_decay": use_cosine_decay,
+    #         "full_ft": full_ft,
+    #         "use_lora": cfg.use_lora,
+    #         "n_hist": cfg.n_hist,
+    #         "alpha_max": cfg.alpha_max,
+    #         "k_buckets": cfg.k_buckets,
+    #         "cfg_weight": cfg.cfg_weight,
+    #         "context_dropout_prob": cfg.context_dropout_prob,
+    #         "num_inference_steps": cfg.num_inference_steps,
+    #         "lora_r": cfg.lora_r,
+    #         "lora_alpha": cfg.lora_alpha,
+    #         "lora_dropout": cfg.lora_dropout,
+    #         "height": cfg.height,
+    #         "width": cfg.width,
+    #         "prediction_type": cfg.prediction_type,
+    #         "gradient_checkpointing": cfg.gradient_checkpointing,
+    #     }
+    #     )
+    # except Exception as e:
+    #     print(f"Warning: wandb.init() failed with error: {e}")
+    #     print("Continuing training without wandb logging...")
+
     vae, unet, scheduler, conditioner, noise_bucketer, caption_encoder = build_models(cfg, device)
     train_dataset = DoomDataset(data_dir=data_dir, n_hist=cfg.n_hist, height=cfg.height, width=cfg.width, preload_to_ram=preload_to_ram)
     print(f"Dataset mode: {'Preloaded to RAM' if preload_to_ram else 'Load on-demand from disk'}")
     
-    # DataLoader with single CPU (num_workers=0)
+    # DataLoader with multiple workers
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=0,  # Single CPU for data loading
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=16,  # 16 parallel workers for data loading
         pin_memory=True,  # Faster CPU-to-GPU transfers
     )
-    print(f"DataLoader configured with single CPU (num_workers=0)")
+    print(f"DataLoader configured with 16 parallel workers")
     
     model_dtype = next(unet.parameters()).dtype
     
@@ -775,7 +785,10 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
             avg_loss = running_loss / log_interval
             current_lr = optimizer.param_groups[0]['lr']
             print(f"[Step {global_step}/{num_steps}] Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
-            wandb.log({"loss": avg_loss, "learning_rate": current_lr, "step": global_step})
+            try:
+                wandb.log({"loss": avg_loss, "learning_rate": current_lr, "step": global_step})
+            except:
+                pass  # wandb disabled
             running_loss = 0.0
         
         # Run rollout at specified intervals
@@ -893,7 +906,10 @@ def train(data_dir: str = "debug/rnd", batch_size: int = 4, num_steps: int = 100
         }, f"{save_dir}/checkpoint.pt")
         print(f"✓ Final full FT checkpoint saved to {save_dir}/")
     
-    wandb.finish()
+    try:
+        wandb.finish()
+    except:
+        pass  # wandb disabled
 
 @torch.no_grad()
 def rollout(
