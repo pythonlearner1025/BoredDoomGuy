@@ -57,8 +57,8 @@ def predict_next_frame(vae, unet, scheduler, conditioner, noise_bucketer, cfg,
     """
     with torch.no_grad():
         # Use last N_hist-1 frames and actions (matching training rollout lines 803-808)
-        context_for_encoding = context_frames[:, -(cfg.n_hist - 1):]  # [1, N_hist-1, 3, H, W]
-        action_context = action_history[:, -(cfg.n_hist - 1):]  # [1, N_hist-1, action_vocab_size]
+        context_for_encoding = context_frames[:, -(cfg.n_hist-1):]  # [1, N_hist-1, 3, H, W]
+        action_context = action_history[:, -(cfg.n_hist-1):]  # [1, N_hist-1, action_vocab_size]
 
         ctx = encode_images_to_latents(
             vae, context_for_encoding.flatten(0, 1), cfg.vae_scaling_factor
