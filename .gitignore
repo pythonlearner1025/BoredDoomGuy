@@ -15,6 +15,7 @@ vae_*
 
 *.png
 *.json
+doom_dataset_processed/
 
 
 *.txt
